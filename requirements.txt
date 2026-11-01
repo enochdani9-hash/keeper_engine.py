@@ -1,1 +1,1 @@
-pip install flask requests eth-account web3
+pip install flask requests eth-account web3 
