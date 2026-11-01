@@ -1,6 +1,6 @@
 # ==============================================================================
-# KEEPERPULSE v1.0 — ZERO-LOSS ON-CHAIN BOUNTY HARVESTER (BASE & ARBITRUM)
-# Multicall3 Batch Scanner + Pre-Flight Simulation Guard + Live Command UI
+# KEEPERPULSE v1.1 — ZERO-LOSS ON-CHAIN BOUNTY HARVESTER (BASE & ARBITRUM)
+# Fixed Multicall3 Raw Hex Call + Direct Harvest Pre-Flight Simulation Guard
 # ==============================================================================
 import os
 import sys
@@ -20,14 +20,11 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)]
 )
-logger = logging.getLogger("KeeperPulseV1")
+logger = logging.getLogger("KeeperPulseV11")
 
 app = Flask(__name__)
 app.config["JSON_SORT_KEYS"] = False
 
-# ==============================================================================
-# 1. CONSTANTS, MULTICALL3 & ABI DEFINITIONS
-# ==============================================================================
 STATE_FILE = os.environ.get("KEEPER_STATE_FILE", "keeper_pulse_state.json")
 MULTICALL3_ADDRESS = "0xcA11bde05977b3631167028862bE2a173976CA11"
 
@@ -50,16 +47,14 @@ CHAIN_CONFIGS = {
     }
 }
 
-# 4-byte selectors for raw speed (no heavy ABI overhead during batch scans)
 SEL_CALL_REWARD = "0x6d1ef877"       # callReward() -> uint256
-SEL_PAUSED = "0x5c975abb"            # paused() -> bool
 SEL_HARVEST_NO_ARG = "0x4641257d"    # harvest()
 SEL_HARVEST_ADDR = "0x018ee9b7"      # harvest(address callFeeRecipient)
 
 MULTICALL3_ABI = [
     {
         "inputs": [
-            {" internalType": "bool", "name": "requireSuccess", "type": "bool"},
+            {"internalType": "bool", "name": "requireSuccess", "type": "bool"},
             {
                 "components": [
                     {"internalType": "address", "name": "target", "type": "address"},
@@ -100,17 +95,17 @@ ERC20_BALANCE_ABI = [
 state_lock = threading.RLock()
 scan_lock = threading.Lock()
 vault_catalog = {"base": [], "arbitrum": [], "last_fetched": 0}
+_scan_counter = 0
 
 DEFAULT_STATE = {
-    "version": "v1.0 • Zero-Loss Multicall3 Keeper",
+    "version": "v1.1 • Zero-Loss Multicall3 Keeper",
     "chain": "base",
     "rpc_url": "https://mainnet.base.org",
     "wallet_address": "",
     "private_key": "",
-    "guard_contract": "",
     "live_armed": False,
-    "min_profit_usd": 0.08,
-    "min_profit_Ratio": 2.5,
+    "min_profit_usd": 0.02,
+    "min_profit_Ratio": 1.8,
     "eth_price_usd": 2650.0,
     "native_eth_balance": 0.0,
     "weth_balance": 0.0,
@@ -125,14 +120,11 @@ DEFAULT_STATE = {
     "harvest_ledger": [],
     "logs": [
         f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] "
-        "KeeperPulse v1.0 Initialized: Dry-Run Simulation Guard Active ($0 Gas Risk)."
+        "KeeperPulse v1.1 Online: Multicall3 + Direct Harvest Simulator Active ($0 Gas Risk)."
     ]
 }
 
 
-# ==============================================================================
-# 2. STATE PERSISTENCE & LOGGING
-# ==============================================================================
 def now_hms():
     return datetime.now(timezone.utc).strftime("%H:%M:%S")
 
@@ -147,6 +139,7 @@ def load_state():
                     merged.update(data)
         except Exception:
             pass
+    merged["version"] = "v1.1 • Zero-Loss Multicall3 Keeper"
     return merged
 
 
@@ -172,9 +165,6 @@ def add_log(msg):
             STATE["logs"] = STATE["logs"][:100]
 
 
-# ==============================================================================
-# 3. LIVE ETH PRICE & LONG-TAIL VAULT AUTO-DISCOVERY (BEEFY API)
-# ==============================================================================
 def update_eth_price():
     try:
         r = requests.get(
@@ -194,10 +184,6 @@ def update_eth_price():
 
 
 def refresh_long_tail_vaults(chain_key="base", force=False):
-    """
-    Pulls active yield vaults directly from Beefy Finance's official API
-    and filters for non-EOL, active strategy contracts on Base or Arbitrum.
-    """
     now_ts = time.time()
     if (
         not force
@@ -219,39 +205,41 @@ def refresh_long_tail_vaults(chain_key="base", force=False):
                         and v.get("status") == "active"
                         and v.get("strategy")
                     ):
-                        strat_addr = Web3.to_checksum_address(v["strategy"])
+                        try:
+                            strat_addr = Web3.to_checksum_address(v["strategy"])
+                            vault_addr = Web3.to_checksum_address(v["earnContractAddress"])
+                        except Exception:
+                            continue
                         if strat_addr not in seen_strats:
                             seen_strats.add(strat_addr)
                             filtered.append({
                                 "id": v.get("id", "vault"),
                                 "name": v.get("name", v.get("id", "Vault")),
                                 "strategy": strat_addr,
-                                "vault": Web3.to_checksum_address(v["earnContractAddress"]),
+                                "vault": vault_addr,
                                 "platform": v.get("platformId", "DeFi"),
                                 "last_harvest": int(v.get("lastHarvest") or 0)
                             })
-                # Prioritize mid-cap / long-tail strategies (skip top 5 hyper-crowded ones)
-                vault_catalog[c_key] = filtered[5:95] if len(filtered) > 15 else filtered[:85]
+                # Sort by oldest lastHarvest first (most overdue for a harvest!)
+                filtered.sort(key=lambda x: x["last_harvest"] if x["last_harvest"] > 0 else 9999999999)
+                vault_catalog[c_key] = filtered[:90]
 
             vault_catalog["last_fetched"] = now_ts
             count = len(vault_catalog.get(chain_key, []))
             with state_lock:
                 STATE["vaults_monitored"] = count
-            add_log(f"📡 Discovered {count} active Long-Tail strategy contracts on {chain_key.upper()}.")
+            add_log(f"📡 Discovered {count} active strategy contracts on {chain_key.upper()} (Sorted by overdue harvest).")
     except Exception as e:
         add_log(f"⚠️ Vault discovery notice: {e}")
 
     return vault_catalog.get(chain_key, [])
 
 
-# ==============================================================================
-# 4. WEB3 CONNECTION & WALLET BALANCE SYNC
-# ==============================================================================
 def get_web3():
     with state_lock:
         chain_key = STATE.get("chain", "base")
         rpc_url = (STATE.get("rpc_url") or CHAIN_CONFIGS[chain_key]["default_rpc"]).strip()
-    w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 7}))
+    w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 8}))
     return w3, chain_key, CHAIN_CONFIGS[chain_key]
 
 
@@ -271,7 +259,7 @@ def sync_wallet_balances():
             return False, f"Invalid private key format: {e}"
 
     if not addr or not Web3.is_address(addr):
-        return False, "No valid wallet address configured (Running in Dry-Run Mode)."
+        return False, "No wallet address configured (Running in Dry-Run Mode)."
 
     checksum_addr = Web3.to_checksum_address(addr)
     try:
@@ -287,35 +275,22 @@ def sync_wallet_balances():
         with state_lock:
             STATE["native_eth_balance"] = round(native_eth, 6)
             STATE["weth_balance"] = round(weth_bal, 6)
-        return True, f"Native ETH: {native_eth:.5f} | Wrapped ETH Bounty Balance: {weth_bal:.5f}"
+        return True, f"Native ETH: {native_eth:.5f} | WETH: {weth_bal:.5f}"
     except Exception as e:
         return False, f"RPC balance check failed: {e}"
 
 
-# ==============================================================================
-# 5. MULTICALL3 SCANNER & ZERO-LOSS PRE-FLIGHT HARVEST ENGINE
-# ==============================================================================
 def encode_harvest_with_recipient(recipient_address):
     clean_hex = recipient_address.lower().replace("0x", "").rjust(64, "0")
     return SEL_HARVEST_ADDR + clean_hex
 
 
 def simulate_and_execute_harvest(w3, cfg, vault_info, raw_reward_wei, eth_price):
-    """
-    STRICT ZERO-LOSS PRE-FLIGHT GUARD:
-    1. Simulates `harvest(recipient)` (or `harvest()`) via `eth_estimateGas`.
-       If the strategy would revert or was already harvested, `estimate_gas` throws
-       an exception and we spend $0.00!
-    2. Computes exact L2 gas cost and verifies `bounty_usd >= gas_cost_usd * min_ratio`.
-    3. In Dry-Run mode (or if unarmed), logs the verified opportunity.
-    4. In Live Armed mode, signs and broadcasts with a tight gas limit cap.
-    """
     with state_lock:
         live_armed = bool(STATE.get("live_armed", False))
         priv_key = (STATE.get("private_key") or "").strip()
         wallet_addr = (STATE.get("wallet_address") or "").strip()
-        min_profit_usd = float(STATE.get("min_profit_usd") or 0.08)
-        min_ratio = float(STATE.get("min_profit_Ratio") or 2.5)
+        min_profit_usd = float(STATE.get("min_profit_usd") or 0.02)
 
     caller_addr = (
         Web3.to_checksum_address(wallet_addr)
@@ -324,7 +299,6 @@ def simulate_and_execute_harvest(w3, cfg, vault_info, raw_reward_wei, eth_price)
     )
     strat_addr = Web3.to_checksum_address(vault_info["strategy"])
 
-    # Step 1: Pre-flight simulation using `harvest(address)` first, fallback to `harvest()`
     call_data = encode_harvest_with_recipient(caller_addr)
     estimated_gas = None
     for candidate_data in (call_data, SEL_HARVEST_NO_ARG):
@@ -342,10 +316,8 @@ def simulate_and_execute_harvest(w3, cfg, vault_info, raw_reward_wei, eth_price)
             continue
 
     if not estimated_gas:
-        # Strategy harvest would revert on-chain -> Blocked for free!
         return None
 
-    # Step 2: Calculate exact gas cost vs. caller bounty
     gas_price_wei = w3.eth.gas_price
     gas_cost_wei = estimated_gas * gas_price_wei
     gas_cost_eth = float(Web3.from_wei(gas_cost_wei, "ether"))
@@ -355,7 +327,7 @@ def simulate_and_execute_harvest(w3, cfg, vault_info, raw_reward_wei, eth_price)
     bounty_usd = bounty_eth * eth_price
     net_profit_usd = bounty_usd - gas_cost_usd
 
-    if net_profit_usd < min_profit_usd or (gas_cost_usd > 0 and (bounty_usd / gas_cost_usd) < min_ratio):
+    if net_profit_usd < min_profit_usd:
         return None
 
     opportunity = {
@@ -370,7 +342,6 @@ def simulate_and_execute_harvest(w3, cfg, vault_info, raw_reward_wei, eth_price)
         "time": now_hms()
     }
 
-    # Step 3: If Live Armed + Private Key present, broadcast transaction
     if live_armed and priv_key:
         try:
             acct = Account.from_key(priv_key if priv_key.startswith("0x") else f"0x{priv_key}")
@@ -416,7 +387,6 @@ def simulate_and_execute_harvest(w3, cfg, vault_info, raw_reward_wei, eth_price)
         except Exception as e:
             add_log(f"🛡️ Pre-Broadcast Guard stopped {vault_info['name']}: {e}")
     else:
-        # Dry-Run Verified Hit!
         with state_lock:
             already_logged = any(
                 item.get("vault") == vault_info["name"]
@@ -445,7 +415,8 @@ def simulate_and_execute_harvest(w3, cfg, vault_info, raw_reward_wei, eth_price)
     return opportunity
 
 
-def run_multicall_bounty_scan():
+def run_multicall_bounty_scan(manual=False):
+    global _scan_counter
     if not scan_lock.acquire(blocking=False):
         return
     t0 = time.time()
@@ -461,12 +432,13 @@ def run_multicall_bounty_scan():
             abi=MULTICALL3_ABI
         )
 
-        calls = []
-        for v in vaults:
-            calls.append((v["strategy"], bytes.fromhex(SEL_CALL_REWARD[2:])))
-
+        calls = [(v["strategy"], bytes.fromhex(SEL_CALL_REWARD[2:])) for v in vaults]
         results = multicall.functions.tryAggregate(False, calls).call()
+
         verified_opps = []
+        non_zero_rewards = 0
+        highest_seen_usd = 0.0
+        highest_vault_name = "None"
 
         for idx, (success, return_data) in enumerate(results):
             if not success or not return_data or len(return_data) < 32:
@@ -475,18 +447,24 @@ def run_multicall_bounty_scan():
             if raw_reward_wei <= 0:
                 continue
 
-            # Sanity filter: ignore broken oracle readings > 0.25 ETH
             bounty_eth = float(Web3.from_wei(raw_reward_wei, "ether"))
-            if bounty_eth <= 0.000015 or bounty_eth > 0.25:
+            if bounty_eth <= 0.000001 or bounty_eth > 0.25:
                 continue
 
+            non_zero_rewards += 1
             bounty_usd = bounty_eth * eth_price
-            if bounty_usd >= 0.05:
+            if bounty_usd > highest_seen_usd:
+                highest_seen_usd = bounty_usd
+                highest_vault_name = vaults[idx]["name"]
+
+            if bounty_usd >= 0.015:
                 opp = simulate_and_execute_harvest(w3, cfg, vaults[idx], raw_reward_wei, eth_price)
                 if opp:
                     verified_opps.append(opp)
 
         elapsed_ms = int((time.time() - t0) * 1000)
+        _scan_counter += 1
+
         with state_lock:
             STATE["last_scan_hms"] = now_hms()
             STATE["last_scan_ms"] = elapsed_ms
@@ -496,16 +474,22 @@ def run_multicall_bounty_scan():
             )[:15]
             if len(STATE["harvest_ledger"]) > 50:
                 STATE["harvest_ledger"] = STATE["harvest_ledger"][:50]
+
+        if manual or _scan_counter == 1 or (_scan_counter % 6 == 0):
+            add_log(
+                f"🔍 Multicall3 Batch #{_scan_counter} ({elapsed_ms}ms): Checked {len(vaults)} {chain_key.upper()} vaults | "
+                f"Active Rewards: {non_zero_rewards} | Top Pending: ${highest_seen_usd:.4f} ({highest_vault_name})"
+            )
         save_state()
     except Exception as e:
-        logger.debug(f"Scan cycle notice: {e}")
+        add_log(f"⚠️ RPC Scan notice: {e}")
     finally:
         scan_lock.release()
 
 
 def background_keeper_loop():
     while True:
-        run_multicall_bounty_scan()
+        run_multicall_bounty_scan(manual=False)
         time.sleep(8.0)
 
 
@@ -520,15 +504,13 @@ def start_background_scanner():
         threading.Thread(target=background_keeper_loop, daemon=True).start()
 
 
-# ==============================================================================
-# 6. PEAK COMMAND CENTER UI FOR KEEPERPULSE v1.0
-# ==============================================================================
+# Reuse the exact same UI template
 KEEPER_UI_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>KeeperPulse v1.0 — On-Chain Bounty Harvester</title>
+<title>KeeperPulse v1.1 — On-Chain Bounty Harvester</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&family=JetBrains+Mono:wght@400;600;700&display=swap');
@@ -549,19 +531,18 @@ KEEPER_UI_HTML = """<!DOCTYPE html>
 <body class="pb-16">
 <div class="max-w-5xl mx-auto px-4 pt-5 space-y-4">
 
-  <!-- HEADER -->
   <header class="card p-4">
     <div class="flex flex-wrap items-center justify-between gap-2">
       <div>
         <div class="flex items-center gap-2">
           <span class="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse"></span>
-          <h1 class="text-xl font-extrabold text-white">KeeperPulse <span class="text-emerald-400">v1.0</span></h1>
+          <h1 class="text-xl font-extrabold text-white">KeeperPulse <span class="text-emerald-400">v1.1</span></h1>
           <span class="text-xs px-2.5 py-0.5 rounded-full bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 font-semibold">
             Multicall3 • Zero-Loss Pre-Flight Guard
           </span>
         </div>
         <p class="text-xs text-slate-400 mt-1">
-          Scans 85+ Long-Tail Beefy Vaults in 1 RPC Call • Simulates via eth_estimateGas Before Spending 1 Wei
+          Scans Active Beefy Strategy Contracts in 1 RPC Call • Simulates via eth_estimateGas Before Spending 1 Wei
         </p>
       </div>
       <div class="text-right text-xs">
@@ -570,7 +551,6 @@ KEEPER_UI_HTML = """<!DOCTYPE html>
       </div>
     </div>
 
-    <!-- STATS BAR -->
     <div class="grid grid-cols-2 sm:grid-cols-4 gap-2.5 mt-4">
       <div class="bg-slate-900/90 border border-slate-800 rounded-lg p-3">
         <div class="text-[10px] uppercase text-slate-400">Mode / Network</div>
@@ -591,7 +571,6 @@ KEEPER_UI_HTML = """<!DOCTYPE html>
     </div>
   </header>
 
-  <!-- CONFIGURATION PANEL -->
   <section class="card p-4">
     <div class="flex flex-wrap items-center justify-between gap-2 mb-3">
       <h2 class="text-xs font-bold uppercase tracking-wider text-amber-300">
@@ -599,7 +578,7 @@ KEEPER_UI_HTML = """<!DOCTYPE html>
       </h2>
       <div class="flex gap-2">
         <button onclick="triggerManualScan()" id="scanNowBtn" class="px-3 py-1.5 rounded-lg text-xs font-bold bg-indigo-600 hover:bg-indigo-500 text-white">
-          🔍 Scan 85+ Vaults Now
+          🔍 Scan Vaults Now
         </button>
         <button onclick="toggleLiveMode()" id="liveToggleBtn" class="px-3 py-1.5 rounded-lg text-xs font-bold bg-amber-500 hover:bg-amber-400 text-slate-950">
           🚀 Arm Live Keeper
@@ -621,7 +600,7 @@ KEEPER_UI_HTML = """<!DOCTYPE html>
       </div>
       <div>
         <label class="block text-slate-400 mb-1">Min Net Profit Per Harvest (USD)</label>
-        <input id="minProfitInput" type="number" step="0.01" value="0.08" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-white mono" />
+        <input id="minProfitInput" type="number" step="0.01" value="0.02" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-white mono" />
       </div>
       <div class="sm:col-span-2">
         <label class="block text-slate-400 mb-1">Keeper Wallet Private Key (Optional — Only needed for Live Broadcasts)</label>
@@ -635,7 +614,6 @@ KEEPER_UI_HTML = """<!DOCTYPE html>
     </div>
   </section>
 
-  <!-- LIVE VERIFIED BOUNTIES & LEDGER -->
   <div class="grid grid-cols-1 lg:grid-cols-12 gap-4">
     <div class="lg:col-span-6 card p-4">
       <h3 class="text-xs font-bold uppercase tracking-wider text-emerald-300 mb-2">
@@ -652,7 +630,6 @@ KEEPER_UI_HTML = """<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- LOGS -->
   <section class="card p-4">
     <h3 class="text-xs font-bold uppercase tracking-wider text-slate-300 mb-2">🛡️ Live Multicall3 & Simulation Guard Logs</h3>
     <div id="logsBox" class="mono text-[11px] bg-slate-950 p-3 rounded-lg border border-slate-800 space-y-1 max-h-60 overflow-y-auto text-slate-300"></div>
@@ -686,7 +663,7 @@ async function pollState() {
     const opps = s.live_opportunities || [];
     const oppsEl = document.getElementById('oppsList');
     if (opps.length === 0) {
-      oppsEl.innerHTML = '<div class="text-xs text-slate-500 py-6 text-center">Scanning 85+ strategy contracts every 8s... Waiting for next vault reward maturity above threshold.</div>';
+      oppsEl.innerHTML = '<div class="text-xs text-slate-500 py-6 text-center">Scanning strategy contracts every 8s... Check Logs below for the highest pending reward right now.</div>';
     } else {
       oppsEl.innerHTML = opps.map(o => `
         <div class="p-2.5 rounded-lg bg-slate-900 border border-emerald-500/30 flex items-center justify-between text-xs">
@@ -723,7 +700,7 @@ async function pollState() {
 async function saveConfig() {
   const chain = document.getElementById('chainSelect').value;
   const rpc = document.getElementById('rpcInput').value.trim();
-  const minProf = parseFloat(document.getElementById('minProfitInput').value || '0.08');
+  const minProf = parseFloat(document.getElementById('minProfitInput').value || '0.02');
   const pk = document.getElementById('privKeyInput').value.trim();
   await fetch('/configure', {
     method: 'POST',
@@ -738,7 +715,7 @@ async function triggerManualScan() {
   const btn = document.getElementById('scanNowBtn');
   btn.textContent = '⏳ Scanning...';
   await fetch('/scan_now', { method: 'POST' });
-  btn.textContent = '🔍 Scan 85+ Vaults Now';
+  btn.textContent = '🔍 Scan Vaults Now';
   pollState();
 }
 
@@ -757,9 +734,6 @@ window.addEventListener('DOMContentLoaded', () => {
 """
 
 
-# ==============================================================================
-# 7. FLASK ROUTES
-# ==============================================================================
 @app.route("/")
 def index():
     return render_template_string(KEEPER_UI_HTML)
@@ -791,14 +765,14 @@ def configure():
 
     refresh_long_tail_vaults(STATE["chain"], force=True)
     sync_wallet_balances()
-    run_multicall_bounty_scan()
+    run_multicall_bounty_scan(manual=True)
     save_state()
     return jsonify({"ok": True})
 
 
 @app.route("/scan_now", methods=["POST"])
 def scan_now():
-    run_multicall_bounty_scan()
+    run_multicall_bounty_scan(manual=True)
     return jsonify({"ok": True})
 
 
@@ -816,5 +790,5 @@ def toggle_live():
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5001))
+    port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port, debug=False)
