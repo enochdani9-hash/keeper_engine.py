@@ -2,3 +2,4 @@ flask
 requests
 eth-account
 web3
+py-solc-x
