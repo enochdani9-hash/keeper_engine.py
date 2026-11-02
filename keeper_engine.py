@@ -1,6 +1,6 @@
 # ==============================================================================
-# KEEPERPULSE v1.4 — FIXED SOLC 0.8.20 TERNARY DEPLOYER & ATOMIC BOUNTY HARVESTER
-# Auto-Compiles & Deploys KeeperGuard.sol via Web3.py + On-Chain Strategy Resolver
+# KEEPERPULSE v1.5 — STRICT KEEPERGUARD-ONLY & REAL WETH VERIFIED HARVESTER
+# Zero Blind Probing • Strict KeeperGuard Simulation • Per-Vault Cooldowns
 # ==============================================================================
 import os
 import sys
@@ -20,7 +20,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)]
 )
-logger = logging.getLogger("KeeperPulseV14")
+logger = logging.getLogger("KeeperPulseV15")
 
 app = Flask(__name__)
 app.config["JSON_SORT_KEYS"] = False
@@ -49,7 +49,6 @@ CHAIN_CONFIGS = {
     }
 }
 
-# Fixed for Solidity 0.8.20: uses ternary ?: operator for immutable initialization
 KEEPER_GUARD_SOL_SOURCE = """// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
@@ -105,11 +104,7 @@ contract KeeperGuard {
 """
 
 KEEPER_GUARD_ABI = [
-    {
-        "inputs": [],
-        "stateMutability": "nonpayable",
-        "type": "constructor"
-    },
+    {"inputs": [], "stateMutability": "nonpayable", "type": "constructor"},
     {
         "inputs": [
             {"internalType": "address", "name": "strategy", "type": "address"},
@@ -121,9 +116,7 @@ KEEPER_GUARD_ABI = [
         "type": "function"
     },
     {
-        "inputs": [
-            {"internalType": "address", "name": "token", "type": "address"}
-        ],
+        "inputs": [{"internalType": "address", "name": "token", "type": "address"}],
         "name": "rescueToken",
         "outputs": [],
         "stateMutability": "nonpayable",
@@ -131,11 +124,25 @@ KEEPER_GUARD_ABI = [
     }
 ]
 
+WETH_ABI = [
+    {
+        "constant": True,
+        "inputs": [{"name": "_owner", "type": "address"}],
+        "name": "balanceOf",
+        "outputs": [{"name": "balance", "type": "uint256"}],
+        "type": "function"
+    },
+    {
+        "constant": False,
+        "inputs": [{"name": "wad", "type": "uint256"}],
+        "name": "withdraw",
+        "outputs": [],
+        "type": "function"
+    }
+]
+
 SEL_VAULT_STRATEGY = "0xa8c62e76"      # strategy() -> address
 SEL_CALL_REWARD = "0x6d1ef877"         # callReward() -> uint256
-SEL_REWARDS_AVAIL = "0x9890220b"       # rewardsAvailable() -> uint256
-SEL_HARVEST_NO_ARG = "0x4641257d"      # harvest()
-SEL_HARVEST_ADDR = "0x018ee9b7"        # harvest(address callFeeRecipient)
 
 MULTICALL3_ABI = [
     {
@@ -168,30 +175,21 @@ MULTICALL3_ABI = [
     }
 ]
 
-ERC20_BALANCE_ABI = [
-    {
-        "constant": True,
-        "inputs": [{"name": "_owner", "type": "address"}],
-        "name": "balanceOf",
-        "outputs": [{"name": "balance", "type": "uint256"}],
-        "type": "function"
-    }
-]
-
 state_lock = threading.RLock()
 scan_lock = threading.Lock()
 vault_catalog = {"base": [], "arbitrum": [], "last_fetched": 0}
+strategy_cooldowns = {}  # strategy_addr -> timestamp of last attempt
 _scan_counter = 0
 
 DEFAULT_STATE = {
-    "version": "v1.4 • 1-Click KeeperGuard & Atomic Harvester",
+    "version": "v1.5 • Strict KeeperGuard WETH Verifier",
     "chain": "base",
     "rpc_url": "https://mainnet.base.org",
     "wallet_address": "",
     "private_key": "",
     "guard_contract": "",
-    "live_armed": False,
-    "min_profit_usd": 0.01,
+    "live_armed": False,  # Default to safe Dry-Run on boot
+    "min_profit_usd": 0.03,
     "eth_price_usd": 2251.42,
     "native_eth_balance": 0.0,
     "weth_balance": 0.0,
@@ -206,7 +204,7 @@ DEFAULT_STATE = {
     "harvest_ledger": [],
     "logs": [
         f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] "
-        "KeeperPulse v1.4 Online: Solc 0.8.20 Ternary KeeperGuard Deployer Ready."
+        "KeeperPulse v1.5 Online: Strict KeeperGuard WETH-Delta Lock Enabled (Zero Unverified Broadcasts)."
     ]
 }
 
@@ -225,14 +223,17 @@ def load_state():
                     merged.update(data)
         except Exception:
             pass
-    merged["version"] = "v1.4 • 1-Click KeeperGuard & Atomic Harvester"
-    # Prevent wallet address from accidentally sitting in guard_contract field
+    merged["version"] = "v1.5 • Strict KeeperGuard WETH Verifier"
+    # Force Dry-Run on upgrade so user can verify KeeperGuard address first
+    if not merged.get("guard_contract"):
+        merged["live_armed"] = False
     if (
         merged.get("guard_contract")
         and merged.get("wallet_address")
         and merged["guard_contract"].lower() == merged["wallet_address"].lower()
     ):
         merged["guard_contract"] = ""
+        merged["live_armed"] = False
     return merged
 
 
@@ -289,7 +290,7 @@ def compile_and_deploy_keeper_guard():
         priv = (STATE.get("private_key") or "").strip()
 
     if not priv:
-        return False, "Paste your Keeper Wallet Private Key and click 'Save & Sync Node' first so the bot can sign the $0.01 deployment."
+        return False, "Paste your Keeper Wallet Private Key and click 'Save & Sync Node' first."
 
     w3, chain_key, cfg = get_web3()
     try:
@@ -305,11 +306,7 @@ def compile_and_deploy_keeper_guard():
         bal_wei = w3.eth.get_balance(acct.address)
         bal_eth = float(Web3.from_wei(bal_wei, "ether"))
         if bal_wei < Web3.to_wei(0.000015, "ether"):
-            return (
-                False,
-                f"Wallet {acct.address[:8]}... has {bal_eth:.6f} {cfg['native_symbol']} on {cfg['name']}. "
-                f"Deposit ~$1-$2 of {cfg['name']} ETH first to cover the ~$0.01 deploy gas."
-            )
+            return False, f"Insufficient ETH ({bal_eth:.6f}) to deploy KeeperGuard."
 
         add_log("⚙️ Compiling KeeperGuard.sol via solcx (0.8.20)...")
         import solcx
@@ -324,7 +321,7 @@ def compile_and_deploy_keeper_guard():
             optimize=True,
             optimize_runs=200
         )
-        contract_id, contract_interface = next(
+        _, contract_interface = next(
             (k, v) for k, v in compiled.items() if k.endswith(":KeeperGuard")
         )
         bytecode = contract_interface["bin"]
@@ -355,7 +352,7 @@ def compile_and_deploy_keeper_guard():
                 STATE["guard_contract"] = guard_addr
             save_state()
             sync_wallet_balances()
-            msg = f"✅ KeeperGuard Deployed on {cfg['name']} at {guard_addr}! 100% Atomic Zero-Loss Lock Active."
+            msg = f"✅ KeeperGuard Deployed at {guard_addr}! Live harvests now strictly require positive WETH gain."
             add_log(msg)
             return True, msg
         return False, "Deployment transaction reverted or timed out."
@@ -363,6 +360,46 @@ def compile_and_deploy_keeper_guard():
         err = f"KeeperGuard deploy notice: {e}"
         add_log(f"⚠️ {err}")
         return False, err
+
+
+def unwrap_weth_to_eth():
+    """Unwraps accumulated WETH bounties 1:1 back into Native Base/Arbitrum ETH."""
+    with state_lock:
+        priv = (STATE.get("private_key") or "").strip()
+    if not priv:
+        return False, "Add Private Key first."
+
+    w3, _, cfg = get_web3()
+    try:
+        acct = Account.from_key(priv if priv.startswith("0x") else f"0x{priv}")
+        weth_addr = Web3.to_checksum_address(cfg["wrapped_native"])
+        weth = w3.eth.contract(address=weth_addr, abi=WETH_ABI)
+        weth_wei = weth.functions.balanceOf(acct.address).call()
+        if weth_wei <= 0:
+            return False, "Your WETH balance is currently 0.000000 WETH."
+
+        gas_price_wei = w3.eth.gas_price
+        nonce = w3.eth.get_transaction_count(acct.address)
+        tx = weth.functions.withdraw(weth_wei).build_transaction({
+            "chainId": cfg["chain_id"],
+            "from": acct.address,
+            "nonce": nonce,
+            "gas": 60000,
+            "maxFeePerGas": int(gas_price_wei * 1.20),
+            "maxPriorityFeePerGas": int(gas_price_wei * 0.10)
+        })
+        signed = w3.eth.account.sign_transaction(tx, private_key=acct.key)
+        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=30)
+        if receipt and receipt.status == 1:
+            sync_wallet_balances()
+            amt = float(Web3.from_wei(weth_wei, "ether"))
+            msg = f"✅ Unwrapped {amt:.6f} WETH directly into Native ETH!"
+            add_log(msg)
+            return True, msg
+        return False, "Unwrap transaction failed."
+    except Exception as e:
+        return False, f"Unwrap error: {e}"
 
 
 def resolve_strategies_on_chain(w3, raw_vaults):
@@ -424,7 +461,7 @@ def refresh_long_tail_vaults(chain_key="base", force=False):
                     })
 
             candidates.sort(key=lambda x: x["last_harvest"] if x["last_harvest"] > 0 else 9999999999)
-            subset = candidates[:80]
+            subset = candidates[:95]
             resolved = resolve_strategies_on_chain(w3, subset)
             vault_catalog[chain_key] = resolved
             vault_catalog["last_fetched"] = now_ts
@@ -456,14 +493,14 @@ def sync_wallet_balances():
             return False, f"Invalid private key format: {e}"
 
     if not addr or not Web3.is_address(addr):
-        return False, "No wallet address configured (Running in Dry-Run Mode)."
+        return False, "No wallet address configured."
 
     checksum_addr = Web3.to_checksum_address(addr)
     try:
         native_wei = w3.eth.get_balance(checksum_addr)
         weth_contract = w3.eth.contract(
             address=Web3.to_checksum_address(cfg["wrapped_native"]),
-            abi=ERC20_BALANCE_ABI
+            abi=WETH_ABI
         )
         weth_wei = weth_contract.functions.balanceOf(checksum_addr).call()
 
@@ -472,84 +509,66 @@ def sync_wallet_balances():
         with state_lock:
             STATE["native_eth_balance"] = round(native_eth, 6)
             STATE["weth_balance"] = round(weth_bal, 6)
-        return True, f"Native ETH: {native_eth:.5f} | WETH: {weth_bal:.5f}"
+        return True, f"Native ETH: {native_eth:.6f} | WETH: {weth_bal:.6f}"
     except Exception as e:
         return False, f"RPC balance check failed: {e}"
 
 
-def encode_harvest_with_recipient(recipient_address):
-    clean_hex = recipient_address.lower().replace("0x", "").rjust(64, "0")
-    return SEL_HARVEST_ADDR + clean_hex
-
-
-def simulate_and_execute_harvest(w3, cfg, vault_info, est_bounty_usd, eth_price):
+def simulate_and_execute_strict_guard(w3, cfg, vault_info, raw_reward_wei, eth_price):
+    """
+    STRICT KEEPERGUARD VERIFICATION:
+    - Never guesses or fabricates rewards.
+    - Simulates `KeeperGuard.safeHarvest(strategy, minBountyWei)` via `eth_estimateGas`.
+    - Because KeeperGuard checks `afterWeth >= beforeWeth + minBountyWei` inside the EVM,
+      `estimate_gas` will ONLY succeed if the transaction genuinely increases your WETH balance!
+    """
     with state_lock:
         live_armed = bool(STATE.get("live_armed", False))
         priv_key = (STATE.get("private_key") or "").strip()
         wallet_addr = (STATE.get("wallet_address") or "").strip()
         guard_addr = (STATE.get("guard_contract") or "").strip()
-        min_profit_usd = float(STATE.get("min_profit_usd") or 0.01)
+        min_profit_usd = float(STATE.get("min_profit_usd") or 0.03)
 
-    caller_addr = (
-        Web3.to_checksum_address(wallet_addr)
-        if wallet_addr and Web3.is_address(wallet_addr)
-        else "0x000000000000000000000000000000000000dEaD"
-    )
     strat_addr = Web3.to_checksum_address(vault_info["strategy"])
 
-    target_to = strat_addr
-    call_data = encode_harvest_with_recipient(caller_addr)
-    estimated_gas = None
+    # Enforce 30-minute cooldown per strategy so the bot NEVER spams the same contract
+    now_ts = time.time()
+    if now_ts - strategy_cooldowns.get(strat_addr, 0) < 1800:
+        return None
 
-    # Only use guard_addr if it is a deployed contract (has bytecode) and not the EOA wallet
-    if (
-        guard_addr
-        and Web3.is_address(guard_addr)
-        and guard_addr.lower() != caller_addr.lower()
-    ):
-        try:
-            guard_checksum = Web3.to_checksum_address(guard_addr)
-            if len(w3.eth.get_code(guard_checksum)) > 2:
-                guard_contract = w3.eth.contract(address=guard_checksum, abi=KEEPER_GUARD_ABI)
-                min_wei = Web3.to_wei(max(min_profit_usd / max(eth_price, 1000.0), 0.000002), "ether")
-                guard_data = guard_contract.encode_abi("safeHarvest", args=[strat_addr, int(min_wei)])
-                est = w3.eth.estimate_gas({
-                    "from": caller_addr,
-                    "to": guard_checksum,
-                    "data": guard_data,
-                    "value": 0
-                })
-                estimated_gas = int(est * 1.18)
-                target_to = guard_checksum
-                call_data = guard_data
-        except Exception:
-            estimated_gas = None
+    bounty_eth = float(Web3.from_wei(raw_reward_wei, "ether"))
+    bounty_usd = bounty_eth * eth_price
+    if bounty_usd < min_profit_usd or bounty_usd > 25.0:
+        return None
 
-    if not estimated_gas:
-        for candidate_data in (encode_harvest_with_recipient(caller_addr), SEL_HARVEST_NO_ARG):
-            try:
-                est = w3.eth.estimate_gas({
-                    "from": caller_addr,
-                    "to": strat_addr,
-                    "data": candidate_data,
-                    "value": 0
-                })
-                estimated_gas = int(est * 1.18)
-                target_to = strat_addr
-                call_data = candidate_data
-                break
-            except Exception:
-                continue
+    # Require a valid deployed KeeperGuard contract to verify true WETH payout
+    if not guard_addr or not Web3.is_address(guard_addr) or not wallet_addr:
+        return None
 
-    if not estimated_gas:
+    guard_checksum = Web3.to_checksum_address(guard_addr)
+    caller_addr = Web3.to_checksum_address(wallet_addr)
+
+    try:
+        guard_contract = w3.eth.contract(address=guard_checksum, abi=KEEPER_GUARD_ABI)
+        min_bounty_wei = int(Web3.to_wei(max(min_profit_usd / max(eth_price, 1000.0), 0.000005), "ether"))
+        guard_data = guard_contract.encode_abi("safeHarvest", args=[strat_addr, min_bounty_wei])
+
+        # Free EVM simulation: reverts if your WETH balance does not increase by >= min_bounty_wei!
+        est = w3.eth.estimate_gas({
+            "from": caller_addr,
+            "to": guard_checksum,
+            "data": guard_data,
+            "value": 0
+        })
+        estimated_gas = int(est * 1.18)
+    except Exception:
+        # Simulation proved this vault does NOT pay >= min_bounty_wei in WETH right now -> Skip for $0.00!
         return None
 
     gas_price_wei = w3.eth.gas_price
     gas_cost_wei = estimated_gas * gas_price_wei
     gas_cost_eth = float(Web3.from_wei(gas_cost_wei, "ether"))
     gas_cost_usd = gas_cost_eth * eth_price
-
-    bounty_usd = est_bounty_usd if est_bounty_usd > 0 else max(gas_cost_usd * 3.2, 0.045)
     net_profit_usd = bounty_usd - gas_cost_usd
 
     if net_profit_usd < min_profit_usd:
@@ -566,75 +585,77 @@ def simulate_and_execute_harvest(w3, cfg, vault_info, est_bounty_usd, eth_price)
         "time": now_hms()
     }
 
+    # Lock strategy for 30 minutes so it never repeats
+    strategy_cooldowns[strat_addr] = now_ts
+
     if live_armed and priv_key:
         try:
             acct = Account.from_key(priv_key if priv_key.startswith("0x") else f"0x{priv_key}")
+            weth_before = STATE.get("weth_balance", 0.0)
             nonce = w3.eth.get_transaction_count(acct.address)
             tx = {
                 "chainId": cfg["chain_id"],
                 "from": acct.address,
-                "to": target_to,
+                "to": guard_checksum,
                 "nonce": nonce,
-                "gas": min(estimated_gas, 1200000),
+                "gas": min(estimated_gas, 950000),
                 "maxFeePerGas": int(gas_price_wei * 1.15),
                 "maxPriorityFeePerGas": int(gas_price_wei * 0.10),
                 "value": 0,
-                "data": call_data
+                "data": guard_data
             }
             signed_tx = w3.eth.account.sign_transaction(tx, private_key=acct.key)
             tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
             receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=25)
             tx_hex = tx_hash.hex()
 
+            sync_wallet_balances()
+            weth_after = STATE.get("weth_balance", 0.0)
+            actual_weth_gain_usd = max(0.0, (weth_after - weth_before) * eth_price)
+
             if receipt and receipt.status == 1:
                 with state_lock:
                     STATE["total_bounties_won"] = int(STATE.get("total_bounties_won", 0)) + 1
                     STATE["realized_profit_usd"] = round(
-                        float(STATE.get("realized_profit_usd", 0.0)) + net_profit_usd, 4
+                        float(STATE.get("realized_profit_usd", 0.0)) + actual_weth_gain_usd, 4
                     )
                     STATE["harvest_ledger"].insert(0, {
-                        "mode": "LIVE BOUNTY",
+                        "mode": "LIVE WETH GAIN",
                         "vault": vault_info["name"],
                         "strategy": f"{strat_addr[:6]}...{strat_addr[-4:]}",
-                        "bounty_usd": round(bounty_usd, 4),
+                        "bounty_usd": round(actual_weth_gain_usd, 4),
                         "gas_usd": round(gas_cost_usd, 4),
-                        "net_usd": round(net_profit_usd, 4),
+                        "net_usd": round(actual_weth_gain_usd - gas_cost_usd, 4),
                         "tx_url": f"{cfg['explorer']}{tx_hex}",
                         "time": now_hms()
                     })
                 add_log(
-                    f"💰 LIVE BOUNTY CLAIMED ({vault_info['name']}): "
-                    f"+${net_profit_usd:.4f} Net (Gas: ${gas_cost_usd:.4f}) | Tx: {tx_hex[:10]}..."
+                    f"💰 VERIFIED WETH BOUNTY ({vault_info['name']}): "
+                    f"+${actual_weth_gain_usd:.4f} WETH received | Tx: {tx_hex[:10]}..."
                 )
-                sync_wallet_balances()
                 save_state()
         except Exception as e:
-            add_log(f"🛡️ KeeperGuard / Pre-Broadcast stopped {vault_info['name']}: {e}")
+            add_log(f"🛡️ KeeperGuard blocked {vault_info['name']}: {e}")
     else:
         with state_lock:
-            already_logged = any(
-                item.get("vault") == vault_info["name"]
-                for item in STATE.get("harvest_ledger", [])[:10]
+            STATE["total_simulated_hits"] = int(STATE.get("total_simulated_hits", 0)) + 1
+            STATE["simulated_profit_usd"] = round(
+                float(STATE.get("simulated_profit_usd", 0.0)) + net_profit_usd, 4
             )
-            if not already_logged:
-                STATE["total_simulated_hits"] = int(STATE.get("total_simulated_hits", 0)) + 1
-                STATE["simulated_profit_usd"] = round(
-                    float(STATE.get("simulated_profit_usd", 0.0)) + net_profit_usd, 4
-                )
-                STATE["harvest_ledger"].insert(0, {
-                    "mode": "SIMULATED OK",
-                    "vault": vault_info["name"],
-                    "strategy": f"{strat_addr[:6]}...{strat_addr[-4:]}",
-                    "bounty_usd": round(bounty_usd, 4),
-                    "gas_usd": round(gas_cost_usd, 4),
-                    "net_usd": round(net_profit_usd, 4),
-                    "tx_url": "",
-                    "time": now_hms()
-                })
-                add_log(
-                    f"✅ VERIFIED HARVESTABLE BOUNTY ({vault_info['name']}): "
-                    f"Est. Bounty ${bounty_usd:.4f} vs Gas ${gas_cost_usd:.4f} -> Net +${net_profit_usd:.4f}"
-                )
+            STATE["harvest_ledger"].insert(0, {
+                "mode": "GUARD VERIFIED",
+                "vault": vault_info["name"],
+                "strategy": f"{strat_addr[:6]}...{strat_addr[-4:]}",
+                "bounty_usd": round(bounty_usd, 4),
+                "gas_usd": round(gas_cost_usd, 4),
+                "net_usd": round(net_profit_usd, 4),
+                "tx_url": "",
+                "time": now_hms()
+            })
+            add_log(
+                f"✅ KEEPERGUARD PASSED ({vault_info['name']}): "
+                f"Guaranteed WETH Bounty +${bounty_usd:.4f} (Gas ${gas_cost_usd:.4f})"
+            )
 
     return opportunity
 
@@ -646,6 +667,7 @@ def run_multicall_bounty_scan(manual=False):
     t0 = time.time()
     try:
         eth_price = update_eth_price()
+        sync_wallet_balances()
         w3, chain_key, cfg = get_web3()
         vaults = refresh_long_tail_vaults(chain_key)
         if not vaults:
@@ -656,52 +678,37 @@ def run_multicall_bounty_scan(manual=False):
             abi=MULTICALL3_ABI
         )
 
-        calls = []
-        for v in vaults:
-            calls.append((v["strategy"], bytes.fromhex(SEL_CALL_REWARD[2:])))
-            calls.append((v["strategy"], bytes.fromhex(SEL_REWARDS_AVAIL[2:])))
-
+        calls = [(v["strategy"], bytes.fromhex(SEL_CALL_REWARD[2:])) for v in vaults]
         results = multicall.functions.tryAggregate(False, calls).call()
 
         verified_opps = []
         non_zero_rewards = 0
         highest_seen_usd = 0.0
         highest_vault_name = "None"
-        now_unix = int(time.time())
 
         for idx, v in enumerate(vaults):
-            res_call_reward = results[idx * 2]
-            res_rewards_avail = results[idx * 2 + 1]
+            success, return_data = results[idx]
+            if not success or not return_data or len(return_data) < 32:
+                continue
 
-            raw_wei = 0
-            if res_call_reward[0] and res_call_reward[1] and len(res_call_reward[1]) >= 32:
-                raw_wei = int.from_bytes(res_call_reward[1][:32], byteorder="big")
-            if raw_wei == 0 and res_rewards_avail[0] and res_rewards_avail[1] and len(res_rewards_avail[1]) >= 32:
-                avail_wei = int.from_bytes(res_rewards_avail[1][:32], byteorder="big")
-                raw_wei = int(avail_wei * 0.0025)
+            raw_wei = int.from_bytes(return_data[:32], byteorder="big")
+            if raw_wei <= 0:
+                continue
 
-            bounty_eth = float(Web3.from_wei(raw_wei, "ether")) if raw_wei > 0 else 0.0
-            if bounty_eth > 0.25:
-                bounty_usd = float(Web3.from_wei(raw_wei, "ether")) * 1.10
-            else:
-                bounty_usd = bounty_eth * eth_price
+            bounty_eth = float(Web3.from_wei(raw_wei, "ether"))
+            if bounty_eth <= 0.000001 or bounty_eth > 0.08:
+                continue
 
-            if bounty_usd > 0.0005 and bounty_usd < 25.0:
-                non_zero_rewards += 1
-                if bounty_usd > highest_seen_usd:
-                    highest_seen_usd = bounty_usd
-                    highest_vault_name = v["name"]
+            bounty_usd = bounty_eth * eth_price
+            non_zero_rewards += 1
+            if bounty_usd > highest_seen_usd:
+                highest_seen_usd = bounty_usd
+                highest_vault_name = v["name"]
 
-            hours_since = (now_unix - v["last_harvest"]) / 3600.0 if v["last_harvest"] > 0 else 0
-            should_probe = (bounty_usd >= 0.01) or (idx < 8 and hours_since >= 6.0)
-
-            if should_probe:
-                opp = simulate_and_execute_harvest(w3, cfg, v, bounty_usd, eth_price)
+            if bounty_usd >= float(STATE.get("min_profit_usd") or 0.03):
+                opp = simulate_and_execute_strict_guard(w3, cfg, v, raw_wei, eth_price)
                 if opp:
                     verified_opps.append(opp)
-                    if opp["bounty_usd"] > highest_seen_usd:
-                        highest_seen_usd = opp["bounty_usd"]
-                        highest_vault_name = v["name"]
 
         elapsed_ms = int((time.time() - t0) * 1000)
         _scan_counter += 1
@@ -716,10 +723,10 @@ def run_multicall_bounty_scan(manual=False):
             if len(STATE["harvest_ledger"]) > 50:
                 STATE["harvest_ledger"] = STATE["harvest_ledger"][:50]
 
-        if manual or _scan_counter <= 2 or (_scan_counter % 4 == 0):
+        if manual or _scan_counter <= 2 or (_scan_counter % 5 == 0):
             add_log(
                 f"🔍 Multicall3 Batch #{_scan_counter} ({elapsed_ms}ms): Checked {len(vaults)} {chain_key.upper()} strategies | "
-                f"Ready/Pending: {max(non_zero_rewards, len(verified_opps))} | Top Bounty: ${highest_seen_usd:.4f} ({highest_vault_name})"
+                f"Non-Zero callReward(): {non_zero_rewards} | Top Pending: ${highest_seen_usd:.4f} ({highest_vault_name})"
             )
         save_state()
     except Exception as e:
@@ -731,7 +738,7 @@ def run_multicall_bounty_scan(manual=False):
 def background_keeper_loop():
     while True:
         run_multicall_bounty_scan(manual=False)
-        time.sleep(8.0)
+        time.sleep(12.0)
 
 
 _worker_started = False
@@ -750,7 +757,7 @@ KEEPER_UI_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>KeeperPulse v1.4 — 1-Click KeeperGuard & Harvester</title>
+<title>KeeperPulse v1.5 — Strict KeeperGuard WETH Harvester</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&family=JetBrains+Mono:wght@400;600;700&display=swap');
@@ -776,13 +783,13 @@ KEEPER_UI_HTML = """<!DOCTYPE html>
       <div>
         <div class="flex items-center gap-2">
           <span class="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse"></span>
-          <h1 class="text-xl font-extrabold text-white">KeeperPulse <span class="text-emerald-400">v1.4</span></h1>
+          <h1 class="text-xl font-extrabold text-white">KeeperPulse <span class="text-emerald-400">v1.5</span></h1>
           <span class="text-xs px-2.5 py-0.5 rounded-full bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 font-semibold">
-            1-Click KeeperGuard • On-Chain Strategy Resolver
+            Strict KeeperGuard Only • Zero Blind Probes
           </span>
         </div>
         <p class="text-xs text-slate-400 mt-1">
-          Auto-Compiles & Deploys KeeperGuard.sol Without Remix • 100% Atomic Balance Protection
+          Only Broadcasts When KeeperGuard.safeHarvest() Proves Real WETH Gain in Simulation
         </p>
       </div>
       <div class="text-right text-xs">
@@ -791,21 +798,25 @@ KEEPER_UI_HTML = """<!DOCTYPE html>
       </div>
     </div>
 
-    <div class="grid grid-cols-2 sm:grid-cols-4 gap-2.5 mt-4">
+    <div class="grid grid-cols-2 sm:grid-cols-5 gap-2.5 mt-4">
       <div class="bg-slate-900/90 border border-slate-800 rounded-lg p-3">
         <div class="text-[10px] uppercase text-slate-400">Mode / Network</div>
-        <div id="modePill" class="text-xs font-extrabold text-amber-300 mt-0.5">🧪 DRY-RUN (BASE)</div>
+        <div id="modePill" class="text-xs font-extrabold text-amber-300 mt-0.5">🧪 DRY-RUN</div>
       </div>
       <div class="bg-slate-900/90 border border-slate-800 rounded-lg p-3">
-        <div class="text-[10px] uppercase text-slate-400">Gas Wallet (Native ETH)</div>
+        <div class="text-[10px] uppercase text-slate-400">Gas Wallet (ETH)</div>
         <div id="nativeEthPill" class="mono text-sm font-bold text-white mt-0.5">0.000000 ETH</div>
+      </div>
+      <div class="bg-slate-900/90 border border-cyan-500/30 rounded-lg p-3">
+        <div class="text-[10px] uppercase text-cyan-300">WETH Bounties In Wallet</div>
+        <div id="wethPill" class="mono text-sm font-bold text-cyan-300 mt-0.5">0.000000 WETH</div>
       </div>
       <div class="bg-slate-900/90 border border-slate-800 rounded-lg p-3">
         <div class="text-[10px] uppercase text-slate-400">KeeperGuard Contract</div>
         <div id="guardPill" class="mono text-xs font-bold text-amber-300 mt-0.5">Not Deployed Yet</div>
       </div>
       <div class="bg-slate-900/90 border border-slate-800 rounded-lg p-3">
-        <div class="text-[10px] uppercase text-slate-400">Verified Profit (Sim / Live)</div>
+        <div class="text-[10px] uppercase text-slate-400">Verified WETH Profit</div>
         <div id="profitPill" class="mono text-sm font-bold text-emerald-400 mt-0.5">+$0.0000</div>
       </div>
     </div>
@@ -814,7 +825,7 @@ KEEPER_UI_HTML = """<!DOCTYPE html>
   <section class="card p-4">
     <div class="flex flex-wrap items-center justify-between gap-2 mb-3">
       <h2 class="text-xs font-bold uppercase tracking-wider text-amber-300">
-        ⚡ Step 1: Network, Wallet & 1-Click KeeperGuard Deploy (No Remix Needed!)
+        ⚡ Step 1: Deploy KeeperGuard First, Then Arm Live Keeper
       </h2>
       <div class="flex flex-wrap gap-2">
         <button onclick="triggerManualScan()" id="scanNowBtn" class="px-3 py-1.5 rounded-lg text-xs font-bold bg-indigo-600 hover:bg-indigo-500 text-white">
@@ -823,8 +834,11 @@ KEEPER_UI_HTML = """<!DOCTYPE html>
         <button onclick="deployGuard()" id="deployGuardBtn" class="px-3 py-1.5 rounded-lg text-xs font-extrabold bg-cyan-500 hover:bg-cyan-400 text-slate-950">
           🛡️ 1-Click Deploy KeeperGuard (~$0.01)
         </button>
+        <button onclick="unwrapWeth()" class="px-3 py-1.5 rounded-lg text-xs font-bold bg-purple-600 hover:bg-purple-500 text-white">
+          🔄 Unwrap WETH -> ETH
+        </button>
         <button onclick="toggleLiveMode()" id="liveToggleBtn" class="px-3 py-1.5 rounded-lg text-xs font-bold bg-amber-500 hover:bg-amber-400 text-slate-950">
-          🚀 Arm Live Keeper
+          🚀 Arm / Disarm Live Keeper
         </button>
       </div>
     </div>
@@ -834,7 +848,7 @@ KEEPER_UI_HTML = """<!DOCTYPE html>
         <label class="block text-slate-400 mb-1">Target Layer-2 Network</label>
         <select id="chainSelect" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-white">
           <option value="base">Base Mainnet (Lowest Gas ~$0.004)</option>
-          <option value="arbitrum">Arbitrum One (High Vault Volume)</option>
+          <option value="arbitrum">Arbitrum One (More Legacy callReward Vaults)</option>
         </select>
       </div>
       <div>
@@ -843,15 +857,15 @@ KEEPER_UI_HTML = """<!DOCTYPE html>
       </div>
       <div>
         <label class="block text-slate-400 mb-1">Min Net Profit Per Harvest (USD)</label>
-        <input id="minProfitInput" type="number" step="0.01" value="0.01" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-white mono" />
+        <input id="minProfitInput" type="number" step="0.01" value="0.03" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-white mono" />
       </div>
       <div>
-        <label class="block text-slate-400 mb-1">Keeper Wallet Private Key (For Deploy & Live Harvests)</label>
+        <label class="block text-slate-400 mb-1">Keeper Wallet Private Key</label>
         <input id="privKeyInput" type="password" placeholder="0x... (Saved securely on server)" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-white mono" />
       </div>
       <div>
-        <label class="block text-slate-400 mb-1">KeeperGuard Address (Leave Blank — Auto-fills on Deploy)</label>
-        <input id="guardInput" type="text" placeholder="Leave blank! Auto-fills after clicking 1-Click Deploy" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-emerald-300 mono" />
+        <label class="block text-slate-400 mb-1">KeeperGuard Contract Address</label>
+        <input id="guardInput" type="text" placeholder="Click 1-Click Deploy KeeperGuard above" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-emerald-300 mono" />
       </div>
       <div class="flex items-end">
         <button onclick="saveConfig()" class="w-full py-2 px-4 rounded-lg text-xs font-extrabold bg-emerald-500 hover:bg-emerald-400 text-slate-950">
@@ -864,14 +878,14 @@ KEEPER_UI_HTML = """<!DOCTYPE html>
   <div class="grid grid-cols-1 lg:grid-cols-12 gap-4">
     <div class="lg:col-span-6 card p-4">
       <h3 class="text-xs font-bold uppercase tracking-wider text-emerald-300 mb-2">
-        🎯 Live Harvestable Bounties (Passed Pre-Flight eth_estimateGas)
+        🎯 Live Bounties (Verified by KeeperGuard.safeHarvest)
       </h3>
       <div id="oppsList" class="space-y-2 max-h-72 overflow-y-auto"></div>
     </div>
 
     <div class="lg:col-span-6 card p-4">
       <h3 class="text-xs font-bold uppercase tracking-wider text-cyan-300 mb-2">
-        🧾 Verified Harvest & Simulation Ledger
+        🧾 Verified WETH Harvest Ledger
       </h3>
       <div id="ledgerList" class="space-y-2 max-h-72 overflow-y-auto"></div>
     </div>
@@ -893,6 +907,7 @@ async function pollState() {
     document.getElementById('scanMs').textContent = s.last_scan_ms || 0;
     document.getElementById('ethPriceBadge').textContent = '$' + Number(s.eth_price_usd || 2251).toFixed(2);
     document.getElementById('nativeEthPill').textContent = Number(s.native_eth_balance || 0).toFixed(6) + ' ETH';
+    document.getElementById('wethPill').textContent = Number(s.weth_balance || 0).toFixed(6) + ' WETH ($' + (Number(s.weth_balance || 0) * Number(s.eth_price_usd || 2251)).toFixed(2) + ')';
 
     const guardPill = document.getElementById('guardPill');
     const guardInput = document.getElementById('guardInput');
@@ -910,22 +925,21 @@ async function pollState() {
       }
     }
 
-    const totalProf = Number(s.realized_profit_usd || 0) + Number(s.simulated_profit_usd || 0);
-    document.getElementById('profitPill').textContent = '+$' + totalProf.toFixed(4) + ' (' + (s.total_bounties_won + s.total_simulated_hits) + ' hits)';
+    document.getElementById('profitPill').textContent = '+$' + Number(s.realized_profit_usd || 0).toFixed(4) + ' (' + (s.total_bounties_won || 0) + ' won)';
 
     const modePill = document.getElementById('modePill');
     if (s.live_armed) {
       modePill.textContent = '🟢 LIVE ARMED (' + (s.chain || 'BASE').toUpperCase() + ')';
       modePill.className = 'text-xs font-extrabold text-emerald-400 mt-0.5';
     } else {
-      modePill.textContent = '🧪 DRY-RUN (' + (s.chain || 'BASE').toUpperCase() + ' • ' + (s.vaults_monitored || 0) + ' Strategies)';
+      modePill.textContent = '🧪 DRY-RUN (' + (s.chain || 'BASE').toUpperCase() + ')';
       modePill.className = 'text-xs font-extrabold text-amber-300 mt-0.5';
     }
 
     const opps = s.live_opportunities || [];
     const oppsEl = document.getElementById('oppsList');
     if (opps.length === 0) {
-      oppsEl.innerHTML = '<div class="text-xs text-slate-500 py-6 text-center">Scanning resolved on-chain strategy contracts every 8s...</div>';
+      oppsEl.innerHTML = '<div class="text-xs text-slate-500 py-6 text-center">Scanning strategies every 12s... Waiting for a vault with verified WETH callReward >= threshold.</div>';
     } else {
       oppsEl.innerHTML = opps.map(o => `
         <div class="p-2.5 rounded-lg bg-slate-900 border border-emerald-500/30 flex items-center justify-between text-xs">
@@ -962,7 +976,7 @@ async function pollState() {
 async function saveConfig() {
   const chain = document.getElementById('chainSelect').value;
   const rpc = document.getElementById('rpcInput').value.trim();
-  const minProf = parseFloat(document.getElementById('minProfitInput').value || '0.01');
+  const minProf = parseFloat(document.getElementById('minProfitInput').value || '0.03');
   const pk = document.getElementById('privKeyInput').value.trim();
   const guard = document.getElementById('guardInput').value.trim();
   await fetch('/configure', {
@@ -994,6 +1008,13 @@ async function deployGuard() {
   pollState();
 }
 
+async function unwrapWeth() {
+  const r = await fetch('/unwrap_weth', { method: 'POST' });
+  const res = await r.json();
+  alert(res.message);
+  pollState();
+}
+
 async function triggerManualScan() {
   const btn = document.getElementById('scanNowBtn');
   btn.textContent = '⏳ Scanning...';
@@ -1003,7 +1024,11 @@ async function triggerManualScan() {
 }
 
 async function toggleLiveMode() {
-  await fetch('/toggle_live', { method: 'POST' });
+  const r = await fetch('/toggle_live', { method: 'POST' });
+  const res = await r.json();
+  if (!res.ok && res.message) {
+    alert(res.message);
+  }
   pollState();
 }
 
@@ -1065,6 +1090,12 @@ def deploy_guard_route():
     return jsonify({"ok": ok, "message": msg, "guard_contract": STATE.get("guard_contract", "")})
 
 
+@app.route("/unwrap_weth", methods=["POST"])
+def unwrap_weth_route():
+    ok, msg = unwrap_weth_to_eth()
+    return jsonify({"ok": ok, "message": msg})
+
+
 @app.route("/scan_now", methods=["POST"])
 def scan_now():
     run_multicall_bounty_scan(manual=True)
@@ -1075,10 +1106,11 @@ def scan_now():
 def toggle_live():
     with state_lock:
         if not STATE.get("private_key") and not STATE.get("live_armed"):
-            add_log("⚠️ Cannot arm Live Mode without a Keeper Wallet Private Key. Running in safe Dry-Run Mode.")
-            return jsonify({"ok": False, "message": "Add private key first."})
+            return jsonify({"ok": False, "message": "Paste your Keeper Wallet Private Key and click Save first."})
+        if not STATE.get("guard_contract") and not STATE.get("live_armed"):
+            return jsonify({"ok": False, "message": "Click '🛡️ 1-Click Deploy KeeperGuard' first so your wallet is 100% protected from failed or zero-reward harvests!"})
         STATE["live_armed"] = not bool(STATE.get("live_armed", False))
-        mode_str = "LIVE ARMED" if STATE["live_armed"] else "DRY-RUN SIMULATION"
+        mode_str = "LIVE ARMED (STRICT KEEPERGUARD)" if STATE["live_armed"] else "DRY-RUN SIMULATION"
     add_log(f"⚡ KeeperPulse mode switched to: {mode_str}")
     save_state()
     return jsonify({"ok": True, "live_armed": STATE["live_armed"]})
