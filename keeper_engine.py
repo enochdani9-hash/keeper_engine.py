@@ -1,5 +1,5 @@
 # ==============================================================================
-# KEEPERPULSE v1.3 — 1-CLICK KEEPERGUARD AUTO-DEPLOYER & ATOMIC BOUNTY HARVESTER
+# KEEPERPULSE v1.4 — FIXED SOLC 0.8.20 TERNARY DEPLOYER & ATOMIC BOUNTY HARVESTER
 # Auto-Compiles & Deploys KeeperGuard.sol via Web3.py + On-Chain Strategy Resolver
 # ==============================================================================
 import os
@@ -20,7 +20,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)]
 )
-logger = logging.getLogger("KeeperPulseV13")
+logger = logging.getLogger("KeeperPulseV14")
 
 app = Flask(__name__)
 app.config["JSON_SORT_KEYS"] = False
@@ -45,11 +45,11 @@ CHAIN_CONFIGS = {
         "native_symbol": "ETH",
         "wrapped_native": "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",
         "explorer": "https://arbiscan.io/tx/",
-        "addr_explorer": "https://arbiscan.io/address/"
+        "addr_explorer": "https://arbiscan.org/address/"
     }
 }
 
-# Embedded KeeperGuard.sol source for 1-Click Server-Side Compilation & Deployment
+# Fixed for Solidity 0.8.20: uses ternary ?: operator for immutable initialization
 KEEPER_GUARD_SOL_SOURCE = """// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
@@ -64,11 +64,11 @@ contract KeeperGuard {
 
     constructor() {
         owner = msg.sender;
-        if (block.chainid == 8453) {
-            weth = IERC20(0x4200000000000000000000000000000000000006);
-        } else {
-            weth = IERC20(0x82aF49447D8a07e3bd95BD0d56f35241523fBab1);
-        }
+        weth = IERC20(
+            block.chainid == 8453
+                ? 0x4200000000000000000000000000000000000006
+                : 0x82aF49447D8a07e3bd95BD0d56f35241523fBab1
+        );
     }
 
     function safeHarvest(address strategy, uint256 minBountyWei) external {
@@ -131,7 +131,6 @@ KEEPER_GUARD_ABI = [
     }
 ]
 
-# 4-byte selectors
 SEL_VAULT_STRATEGY = "0xa8c62e76"      # strategy() -> address
 SEL_CALL_REWARD = "0x6d1ef877"         # callReward() -> uint256
 SEL_REWARDS_AVAIL = "0x9890220b"       # rewardsAvailable() -> uint256
@@ -185,7 +184,7 @@ vault_catalog = {"base": [], "arbitrum": [], "last_fetched": 0}
 _scan_counter = 0
 
 DEFAULT_STATE = {
-    "version": "v1.3 • 1-Click KeeperGuard & Atomic Harvester",
+    "version": "v1.4 • 1-Click KeeperGuard & Atomic Harvester",
     "chain": "base",
     "rpc_url": "https://mainnet.base.org",
     "wallet_address": "",
@@ -193,7 +192,7 @@ DEFAULT_STATE = {
     "guard_contract": "",
     "live_armed": False,
     "min_profit_usd": 0.01,
-    "eth_price_usd": 2281.15,
+    "eth_price_usd": 2251.42,
     "native_eth_balance": 0.0,
     "weth_balance": 0.0,
     "total_bounties_won": 0,
@@ -207,7 +206,7 @@ DEFAULT_STATE = {
     "harvest_ledger": [],
     "logs": [
         f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] "
-        "KeeperPulse v1.3 Online: 1-Click KeeperGuard Auto-Deployer Ready."
+        "KeeperPulse v1.4 Online: Solc 0.8.20 Ternary KeeperGuard Deployer Ready."
     ]
 }
 
@@ -226,7 +225,14 @@ def load_state():
                     merged.update(data)
         except Exception:
             pass
-    merged["version"] = "v1.3 • 1-Click KeeperGuard & Atomic Harvester"
+    merged["version"] = "v1.4 • 1-Click KeeperGuard & Atomic Harvester"
+    # Prevent wallet address from accidentally sitting in guard_contract field
+    if (
+        merged.get("guard_contract")
+        and merged.get("wallet_address")
+        and merged["guard_contract"].lower() == merged["wallet_address"].lower()
+    ):
+        merged["guard_contract"] = ""
     return merged
 
 
@@ -267,7 +273,7 @@ def update_eth_price():
                 return px
     except Exception:
         pass
-    return STATE.get("eth_price_usd", 2281.15)
+    return STATE.get("eth_price_usd", 2251.42)
 
 
 def get_web3():
@@ -278,9 +284,6 @@ def get_web3():
     return w3, chain_key, CHAIN_CONFIGS[chain_key]
 
 
-# ==============================================================================
-# 1-CLICK KEEPERGUARD COMPILER & ON-CHAIN DEPLOYER (NO REMIX NEEDED)
-# ==============================================================================
 def compile_and_deploy_keeper_guard():
     with state_lock:
         priv = (STATE.get("private_key") or "").strip()
@@ -293,6 +296,8 @@ def compile_and_deploy_keeper_guard():
         acct = Account.from_key(priv if priv.startswith("0x") else f"0x{priv}")
         with state_lock:
             STATE["wallet_address"] = acct.address
+            if STATE.get("guard_contract", "").lower() == acct.address.lower():
+                STATE["guard_contract"] = ""
     except Exception as e:
         return False, f"Invalid Private Key: {e}"
 
@@ -306,7 +311,7 @@ def compile_and_deploy_keeper_guard():
                 f"Deposit ~$1-$2 of {cfg['name']} ETH first to cover the ~$0.01 deploy gas."
             )
 
-        add_log("⚙️ Compiling KeeperGuard.sol on server via solcx (0.8.20)...")
+        add_log("⚙️ Compiling KeeperGuard.sol via solcx (0.8.20)...")
         import solcx
         installed = [str(v) for v in solcx.get_installed_solc_versions()]
         if not any("0.8.20" in v for v in installed):
@@ -334,8 +339,8 @@ def compile_and_deploy_keeper_guard():
             "chainId": cfg["chain_id"],
             "from": acct.address,
             "nonce": nonce,
-            "gas": int(est_gas * 1.20),
-            "maxFeePerGas": int(gas_price_wei * 1.20),
+            "gas": int(est_gas * 1.25),
+            "maxFeePerGas": int(gas_price_wei * 1.25),
             "maxPriorityFeePerGas": int(gas_price_wei * 0.10)
         })
 
@@ -350,7 +355,7 @@ def compile_and_deploy_keeper_guard():
                 STATE["guard_contract"] = guard_addr
             save_state()
             sync_wallet_balances()
-            msg = f"✅ KeeperGuard Live on {cfg['name']} at {guard_addr}! 100% Atomic Zero-Loss Lock Active."
+            msg = f"✅ KeeperGuard Deployed on {cfg['name']} at {guard_addr}! 100% Atomic Zero-Loss Lock Active."
             add_log(msg)
             return True, msg
         return False, "Deployment transaction reverted or timed out."
@@ -360,9 +365,6 @@ def compile_and_deploy_keeper_guard():
         return False, err
 
 
-# ==============================================================================
-# ON-CHAIN STRATEGY RESOLVER & MULTICALL3 SCANNER
-# ==============================================================================
 def resolve_strategies_on_chain(w3, raw_vaults):
     multicall = w3.eth.contract(
         address=Web3.to_checksum_address(MULTICALL3_ADDRESS),
@@ -448,6 +450,8 @@ def sync_wallet_balances():
             addr = acct.address
             with state_lock:
                 STATE["wallet_address"] = addr
+                if STATE.get("guard_contract", "").lower() == addr.lower():
+                    STATE["guard_contract"] = ""
         except Exception as e:
             return False, f"Invalid private key format: {e}"
 
@@ -493,30 +497,34 @@ def simulate_and_execute_harvest(w3, cfg, vault_info, est_bounty_usd, eth_price)
     )
     strat_addr = Web3.to_checksum_address(vault_info["strategy"])
 
-    # If KeeperGuard is deployed & valid, simulate through KeeperGuard.safeHarvest first!
     target_to = strat_addr
     call_data = encode_harvest_with_recipient(caller_addr)
     estimated_gas = None
 
-    if guard_addr and Web3.is_address(guard_addr):
+    # Only use guard_addr if it is a deployed contract (has bytecode) and not the EOA wallet
+    if (
+        guard_addr
+        and Web3.is_address(guard_addr)
+        and guard_addr.lower() != caller_addr.lower()
+    ):
         try:
             guard_checksum = Web3.to_checksum_address(guard_addr)
-            guard_contract = w3.eth.contract(address=guard_checksum, abi=KEEPER_GUARD_ABI)
-            min_wei = Web3.to_wei(max(min_profit_usd / max(eth_price, 1000.0), 0.000002), "ether")
-            guard_data = guard_contract.encode_abi("safeHarvest", args=[strat_addr, int(min_wei)])
-            est = w3.eth.estimate_gas({
-                "from": caller_addr,
-                "to": guard_checksum,
-                "data": guard_data,
-                "value": 0
-            })
-            estimated_gas = int(est * 1.18)
-            target_to = guard_checksum
-            call_data = guard_data
+            if len(w3.eth.get_code(guard_checksum)) > 2:
+                guard_contract = w3.eth.contract(address=guard_checksum, abi=KEEPER_GUARD_ABI)
+                min_wei = Web3.to_wei(max(min_profit_usd / max(eth_price, 1000.0), 0.000002), "ether")
+                guard_data = guard_contract.encode_abi("safeHarvest", args=[strat_addr, int(min_wei)])
+                est = w3.eth.estimate_gas({
+                    "from": caller_addr,
+                    "to": guard_checksum,
+                    "data": guard_data,
+                    "value": 0
+                })
+                estimated_gas = int(est * 1.18)
+                target_to = guard_checksum
+                call_data = guard_data
         except Exception:
             estimated_gas = None
 
-    # Fallback direct strategy pre-flight check (for Dry-Run or non-WETH caller rewards)
     if not estimated_gas:
         for candidate_data in (encode_harvest_with_recipient(caller_addr), SEL_HARVEST_NO_ARG):
             try:
@@ -742,7 +750,7 @@ KEEPER_UI_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>KeeperPulse v1.3 — 1-Click KeeperGuard & Harvester</title>
+<title>KeeperPulse v1.4 — 1-Click KeeperGuard & Harvester</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&family=JetBrains+Mono:wght@400;600;700&display=swap');
@@ -768,7 +776,7 @@ KEEPER_UI_HTML = """<!DOCTYPE html>
       <div>
         <div class="flex items-center gap-2">
           <span class="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse"></span>
-          <h1 class="text-xl font-extrabold text-white">KeeperPulse <span class="text-emerald-400">v1.3</span></h1>
+          <h1 class="text-xl font-extrabold text-white">KeeperPulse <span class="text-emerald-400">v1.4</span></h1>
           <span class="text-xs px-2.5 py-0.5 rounded-full bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 font-semibold">
             1-Click KeeperGuard • On-Chain Strategy Resolver
           </span>
@@ -779,7 +787,7 @@ KEEPER_UI_HTML = """<!DOCTYPE html>
       </div>
       <div class="text-right text-xs">
         <div class="text-slate-400">Last Scan: <span id="lastScanClock" class="mono text-emerald-400 font-bold">--:--:--</span> (<span id="scanMs" class="mono">0</span>ms)</div>
-        <div class="text-slate-500">ETH Price: <span id="ethPriceBadge" class="mono text-slate-300">$2281.15</span></div>
+        <div class="text-slate-500">ETH Price: <span id="ethPriceBadge" class="mono text-slate-300">$2251.42</span></div>
       </div>
     </div>
 
@@ -842,8 +850,8 @@ KEEPER_UI_HTML = """<!DOCTYPE html>
         <input id="privKeyInput" type="password" placeholder="0x... (Saved securely on server)" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-white mono" />
       </div>
       <div>
-        <label class="block text-slate-400 mb-1">KeeperGuard Address (Auto-fills on 1-Click Deploy)</label>
-        <input id="guardInput" type="text" placeholder="0x... (Click 1-Click Deploy above)" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-emerald-300 mono" />
+        <label class="block text-slate-400 mb-1">KeeperGuard Address (Leave Blank — Auto-fills on Deploy)</label>
+        <input id="guardInput" type="text" placeholder="Leave blank! Auto-fills after clicking 1-Click Deploy" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-emerald-300 mono" />
       </div>
       <div class="flex items-end">
         <button onclick="saveConfig()" class="w-full py-2 px-4 rounded-lg text-xs font-extrabold bg-emerald-500 hover:bg-emerald-400 text-slate-950">
@@ -883,7 +891,7 @@ async function pollState() {
     const s = await r.json();
     document.getElementById('lastScanClock').textContent = s.last_scan_hms || '--:--:--';
     document.getElementById('scanMs').textContent = s.last_scan_ms || 0;
-    document.getElementById('ethPriceBadge').textContent = '$' + Number(s.eth_price_usd || 2281).toFixed(2);
+    document.getElementById('ethPriceBadge').textContent = '$' + Number(s.eth_price_usd || 2251).toFixed(2);
     document.getElementById('nativeEthPill').textContent = Number(s.native_eth_balance || 0).toFixed(6) + ' ETH';
 
     const guardPill = document.getElementById('guardPill');
@@ -897,6 +905,9 @@ async function pollState() {
     } else {
       guardPill.textContent = 'Not Deployed Yet';
       guardPill.className = 'mono text-xs font-bold text-amber-300 mt-0.5';
+      if (document.activeElement !== guardInput) {
+        guardInput.value = '';
+      }
     }
 
     const totalProf = Number(s.realized_profit_usd || 0) + Number(s.simulated_profit_usd || 0);
@@ -1035,7 +1046,11 @@ def configure():
         if data.get("private_key"):
             STATE["private_key"] = data["private_key"].strip()
         if data.get("guard_contract") is not None:
-            STATE["guard_contract"] = data["guard_contract"].strip()
+            candidate = data["guard_contract"].strip()
+            if candidate.lower() != STATE.get("wallet_address", "").lower():
+                STATE["guard_contract"] = candidate
+            else:
+                STATE["guard_contract"] = ""
 
     refresh_long_tail_vaults(STATE["chain"], force=True)
     sync_wallet_balances()
