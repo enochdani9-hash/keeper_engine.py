@@ -1,1971 +1,1792 @@
-# ==============================================================================
-# KEEPERPULSE v4.0 — MORPHO ZERO-FEE FLASH LOAN LIQUIDATOR + DUAL-CORE MASTER
-# 1. Morpho Blue (0xBBBB...FFCb) Zero-Collateral Flash Loan Engine (KeeperGuardV3)
-# 2. Moonwell Comptroller Underwater Micro-Account Scanner (Multicall3)
-# 3. Moonwell Flagship ETH Vault (Wei-Precision Yield Tracker) + Non-HOD Bounties
-# 4. Gate.io v4 API Spot Volatility Skimmer (QNT_USDT / LTC_USDT) + PWA + /ping
-# ==============================================================================
 import os
-import sys
 import time
 import json
 import hmac
 import hashlib
-import logging
 import threading
-from datetime import datetime, timezone
-
+from datetime import datetime
+from decimal import Decimal, ROUND_DOWN
 import requests
-from flask import Flask, Response, request, jsonify, render_template_string
-from eth_account import Account
-from web3 import Web3
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
-logger = logging.getLogger("KeeperPulseV40")
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from flask import Flask, request, jsonify, Response, render_template_string
 
 app = Flask(__name__)
-app.config["JSON_SORT_KEYS"] = False
 
-# ==============================================================================
-# 1. CONSTANTS, ON-CHAIN ADDRESSES & PERMANENT BASELINES
-# ==============================================================================
-STATE_FILE = os.environ.get("KEEPER_STATE_FILE", "keeper_pulse_state.json")
-MULTICALL3_ADDRESS = "0xcA11bde05977b3631167028862bE2a173976CA11"
-MORPHO_BLUE_BASE = "0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb"
-MOONWELL_COMPTROLLER = "0xfBb21d0380beE3312B33c4353c8936a0F13EF26C"
-MOONWELL_MUSDC = "0xEdc817A28E8B93B03976FBd4a3dDBc9f7D176c22"
-MOONWELL_MWETH = "0x628ff693426583D9a7FB391E54366292F509D457"
+STATE_FILE = "vaultskimmer_v5_8_state.json"
+GATE_HOST = "https://api.gateio.ws"
+GATE_PREFIX = "/api/v4"
 
-GATE_API_HOST = "https://api.gateio.ws"
-GATE_API_PREFIX = "/api/v4"
+HTTP_SESSION = requests.Session()
+adapter = HTTPAdapter(
+    pool_connections=16,
+    pool_maxsize=16,
+    max_retries=Retry(total=2, backoff_factor=0.15, status_forcelist=[502, 503, 504])
+)
+HTTP_SESSION.mount("https://", adapter)
 
-BASE_WETH = "0x4200000000000000000000000000000000000006"
-MOONWELL_MWETH_VAULT = "0xa0E430870c4604CcfC7B38Ca7845B1FF653D0ff1"
-WELL_TOKEN_BASE = "0xA88594D404727625A9437C3f886C7643872296AE"
-AERO_TOKEN_BASE = "0x940181a94A35A4569E4529A3CDfB74e38FD98631"
-USDC_TOKEN_BASE = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+PAIR_META_CACHE = {}
 
-DEFAULT_WALLET_ADDR = "0x0afaA2d657C44E9E8579c5cE9c09D00c92A463C3"
-DEFAULT_GUARD_ADDR = "0xab1d119FC3468036B2b92c69A5377ee0b408b215"
-INITIAL_DEPOSIT_WEI_BASELINE = 2424850000000000  # 0.00242485 ETH initial Moonwell deposit
-INITIAL_DEPOSIT_USD_BASELINE = 5.46              # $5.46 USD value at deposit time
 
-CHAIN_CONFIGS = {
-    "base": {
-        "name": "Base Mainnet",
-        "chain_id": 8453,
-        "default_rpc": "https://mainnet.base.org",
-        "native_symbol": "ETH",
-        "wrapped_native": BASE_WETH,
-        "aero_token": AERO_TOKEN_BASE,
-        "usdc_token": USDC_TOKEN_BASE,
-        "explorer": "https://basescan.org/tx/",
-        "addr_explorer": "https://basescan.org/address/"
-    },
-    "arbitrum": {
-        "name": "Arbitrum One",
-        "chain_id": 42161,
-        "default_rpc": "https://arb1.arbitrum.io/rpc",
-        "native_symbol": "ETH",
-        "wrapped_native": "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",
-        "aero_token": "0x912CE59144191C1204E64559FE8253a0e49E6548",
-        "usdc_token": "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
-        "explorer": "https://arbiscan.io/tx/",
-        "addr_explorer": "https://arbiscan.org/address/"
-    }
-}
+def fmt_px(val):
+    v = float(val or 0.0)
+    if v == 0:
+        return "$0.0000"
+    if v < 0.0001:
+        return f"${v:.8f}"
+    if v < 0.01:
+        return f"${v:.6f}"
+    return f"${v:.4f}"
 
-# ==============================================================================
-# 2. EMBEDDED SOLIDITY SOURCE (KEEPERGUARD V3 WITH MORPHO ZERO-FEE FLASH LOANS)
-# ==============================================================================
-KEEPER_GUARD_SOL_SOURCE = """// SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
 
-interface IERC20 {
-    function balanceOf(address account) external view returns (uint256);
-    function transfer(address to, uint256 value) external returns (bool);
-    function approve(address spender, uint256 value) external returns (bool);
-}
-
-interface IMorpho {
-    function flashLoan(address token, uint256 assets, bytes calldata data) external;
-}
-
-contract KeeperGuard {
-    address public immutable owner;
-    address public constant MORPHO = 0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb;
-    IERC20 public immutable weth;
-    IERC20 public immutable tokenA;
-    IERC20 public immutable usdc;
-
-    constructor() {
-        owner = msg.sender;
-        weth = IERC20(
-            block.chainid == 8453
-                ? 0x4200000000000000000000000000000000000006
-                : 0x82aF49447D8a07e3bd95BD0d56f35241523fBab1
-        );
-        tokenA = IERC20(
-            block.chainid == 8453
-                ? 0x940181a94A35A4569E4529A3CDfB74e38FD98631
-                : 0x912CE59144191C1204E64559FE8253a0e49E6548
-        );
-        usdc = IERC20(
-            block.chainid == 8453
-                ? 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913
-                : 0xaf88d065e77c8cC2239327C5EDb3A432268e5831
-        );
+def make_slot(pair, principal, skim_pct, stop_reset_pct=99.0, pullback_pct=0.30, entry_price=0.0, slot_type="LIVE"):
+    return {
+        "pair": pair,
+        "slot_type": slot_type,
+        "principal_usdt": float(principal),
+        "skim_target_pct": float(skim_pct),
+        "stop_reset_pct": float(stop_reset_pct),
+        "rebuy_pullback_pct": float(pullback_pct),
+        "entry_price": float(entry_price),
+        "actual_cost_usdt": 0.0,
+        "last_skim_sell_price": 0.0,
+        "last_trade_ts": 0.0,
+        "started_ts": time.time(),
+        "phase": "WAITING_TO_BUY",
+        "paper_base_bal": 0.0,
+        "base_balance": 0.0,
+        "position_value_usdt": 0.0,
+        "last_price": 0.0,
+        "price_prec": 4,
+        "high_24h": 0.0,
+        "low_24h": 0.0,
+        "change_24h_pct": 0.0,
+        "range_24h_pct": 0.0,
+        "target_sell_price": 0.0,
+        "stop_reset_price": 0.0,
+        "target_rebuy_price": 0.0,
+        "unrealized_pnl_usdt": 0.0,
+        "unrealized_pnl_pct": 0.0,
+        "slot_skimmed_usdt": 0.0,
+        "slot_skim_count": 0,
+        "status_msg": "Slot armed — awaiting next scan..."
     }
 
-    function _totalSnapshot() internal view returns (uint256 wBal, uint256 aBal, uint256 uBal, uint256 eBal) {
-        wBal = weth.balanceOf(owner) + weth.balanceOf(address(this));
-        aBal = tokenA.balanceOf(owner) + tokenA.balanceOf(address(this));
-        uBal = usdc.balanceOf(owner) + usdc.balanceOf(address(this));
-        eBal = owner.balance + address(this).balance;
-    }
-
-    function _sweepToOwner() internal {
-        uint256 w = weth.balanceOf(address(this));
-        if (w > 0) weth.transfer(owner, w);
-        uint256 a = tokenA.balanceOf(address(this));
-        if (a > 0) tokenA.transfer(owner, a);
-        uint256 u = usdc.balanceOf(address(this));
-        if (u > 0) usdc.transfer(owner, u);
-        if (address(this).balance > 0) payable(owner).transfer(address(this).balance);
-    }
-
-    function safeHarvest(address strategy, uint256 minBountyWei) external {
-        (uint256 w0, uint256 a0, uint256 u0, uint256 e0) = _totalSnapshot();
-
-        (bool ok, ) = strategy.call(abi.encodeWithSignature("harvest(address)", owner));
-        if (!ok) {
-            (bool ok2, ) = strategy.call(abi.encodeWithSignature("harvest()"));
-            require(ok2, "Strategy harvest reverted");
-        }
-
-        _sweepToOwner();
-        (uint256 w1, uint256 a1, uint256 u1, uint256 e1) = _totalSnapshot();
-
-        bool gainedWeth = w1 >= w0 + minBountyWei;
-        bool gainedEth  = e1 >= e0 + minBountyWei;
-        bool gainedAero = a1 > a0 + 100000000000000;
-        bool gainedUsdc = u1 > u0 + 5000;
-
-        require(
-            gainedWeth || gainedEth || gainedAero || gainedUsdc,
-            "KeeperGuardV3: Zero reward delta - Revert!"
-        );
-    }
-
-    // ZERO-COLLATERAL MORPHO BLUE FLASH LOAN EXECUTOR (0% FEE)
-    function executeFlashArbitrageOrLiquidation(
-        address loanToken,
-        uint256 loanAmount,
-        address targetContract,
-        bytes calldata targetCallData,
-        uint256 minProfitTokenUnits
-    ) external {
-        bytes memory data = abi.encode(loanToken, targetContract, targetCallData, minProfitTokenUnits);
-        IMorpho(MORPHO).flashLoan(loanToken, loanAmount, data);
-    }
-
-    function onMorphoFlashLoan(uint256 assets, bytes calldata data) external {
-        require(msg.sender == MORPHO, "Only Morpho Blue");
-        (
-            address loanToken,
-            address targetContract,
-            bytes memory targetCallData,
-            uint256 minProfit
-        ) = abi.decode(data, (address, address, bytes, uint256));
-
-        IERC20 token = IERC20(loanToken);
-        if (targetContract != address(0) && targetCallData.length > 0) {
-            token.approve(targetContract, assets);
-            (bool ok, ) = targetContract.call(targetCallData);
-            require(ok, "Flash target execution reverted");
-        }
-
-        uint256 balAfter = token.balanceOf(address(this));
-        require(balAfter >= assets + minProfit, "FlashLoan: Profit below minimum - Revert!");
-
-        // Approve Morpho to pull back the exact borrowed principal (0% fee)
-        token.approve(MORPHO, assets);
-
-        // Sweep leftover net profit directly to owner wallet
-        uint256 netProfit = balAfter - assets;
-        if (netProfit > 0) {
-            token.transfer(owner, netProfit);
-        }
-    }
-
-    function rescueToken(address token) external {
-        require(msg.sender == owner, "Only owner");
-        IERC20 t = IERC20(token);
-        t.transfer(owner, t.balanceOf(address(this)));
-    }
-
-    receive() external payable {}
-}
-"""
-
-KEEPER_GUARD_ABI = [
-    {"inputs": [], "stateMutability": "nonpayable", "type": "constructor"},
-    {
-        "inputs": [
-            {"internalType": "address", "name": "strategy", "type": "address"},
-            {"internalType": "uint256", "name": "minBountyWei", "type": "uint256"}
-        ],
-        "name": "safeHarvest",
-        "outputs": [],
-        "stateMutability": "nonpayable",
-        "type": "function"
-    },
-    {
-        "inputs": [
-            {"internalType": "address", "name": "loanToken", "type": "address"},
-            {"internalType": "uint256", "name": "loanAmount", "type": "uint256"},
-            {"internalType": "address", "name": "targetContract", "type": "address"},
-            {"internalType": "bytes", "name": "targetCallData", "type": "bytes"},
-            {"internalType": "uint256", "name": "minProfitTokenUnits", "type": "uint256"}
-        ],
-        "name": "executeFlashArbitrageOrLiquidation",
-        "outputs": [],
-        "stateMutability": "nonpayable",
-        "type": "function"
-    },
-    {
-        "inputs": [{"internalType": "address", "name": "token", "type": "address"}],
-        "name": "rescueToken",
-        "outputs": [],
-        "stateMutability": "nonpayable",
-        "type": "function"
-    }
-]
-
-WETH_ABI = [
-    {"constant": False, "inputs": [], "name": "deposit", "outputs": [], "payable": True, "stateMutability": "payable", "type": "function"},
-    {"constant": False, "inputs": [{"name": "wad", "type": "uint256"}], "name": "withdraw", "outputs": [], "stateMutability": "nonpayable", "type": "function"},
-    {"constant": True, "inputs": [{"name": "_owner", "type": "address"}], "name": "balanceOf", "outputs": [{"name": "balance", "type": "uint256"}], "stateMutability": "view", "type": "function"},
-    {"constant": False, "inputs": [{"name": "_spender", "type": "address"}, {"name": "_value", "type": "uint256"}], "name": "approve", "outputs": [{"name": "", "type": "bool"}], "stateMutability": "nonpayable", "type": "function"},
-    {"constant": True, "inputs": [{"name": "_owner", "type": "address"}, {"name": "_spender", "type": "address"}], "name": "allowance", "outputs": [{"name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"}
-]
-
-ERC4626_VAULT_ABI = [
-    {"inputs": [{"internalType": "uint256", "name": "assets", "type": "uint256"}, {"internalType": "address", "name": "receiver", "type": "address"}], "name": "deposit", "outputs": [{"internalType": "uint256", "name": "shares", "type": "uint256"}], "stateMutability": "nonpayable", "type": "function"},
-    {"inputs": [{"internalType": "uint256", "name": "shares", "type": "uint256"}, {"internalType": "address", "name": "receiver", "type": "address"}, {"internalType": "address", "name": "owner", "type": "address"}], "name": "redeem", "outputs": [{"internalType": "uint256", "name": "assets", "type": "uint256"}], "stateMutability": "nonpayable", "type": "function"},
-    {"inputs": [{"internalType": "address", "name": "account", "type": "address"}], "name": "balanceOf", "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"},
-    {"inputs": [{"internalType": "uint256", "name": "shares", "type": "uint256"}], "name": "convertToAssets", "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"}
-]
-
-SEL_VAULT_STRATEGY = "0xa8c62e76"
-SEL_CALL_REWARD = "0x6d1ef877"
-SEL_REWARDS_AVAIL = "0x9890220b"
-SEL_HARVEST_ON_DEPOSIT = "0x573fef0a"
-SEL_GET_ACCT_LIQUIDITY = "0x5ec88c79"  # getAccountLiquidity(address) -> (uint256, uint256, uint256)
-
-MULTICALL3_ABI = [
-    {
-        "inputs": [
-            {"internalType": "bool", "name": "requireSuccess", "type": "bool"},
-            {"components": [{"internalType": "address", "name": "target", "type": "address"}, {"internalType": "bytes", "name": "callData", "type": "bytes"}], "internalType": "struct Multicall3.Call[]", "name": "calls", "type": "tuple[]"}
-        ],
-        "name": "tryAggregate",
-        "outputs": [
-            {"components": [{"internalType": "bool", "name": "success", "type": "bool"}, {"internalType": "bytes", "name": "returnData", "type": "bytes"}], "internalType": "struct Multicall3.Result[]", "name": "returnData", "type": "tuple[]"}
-        ],
-        "stateMutability": "payable",
-        "type": "function"
-    }
-]
-
-# ==============================================================================
-# 3. GLOBAL STATE MANAGEMENT & ENVIRONMENT AUTO-RECOVERY
-# ==============================================================================
-state_lock = threading.RLock()
-scan_lock = threading.Lock()
-vault_catalog = {"base": [], "arbitrum": [], "last_fetched": 0}
-monitored_borrowers = set([
-    "0x0afaA2d657C44E9E8579c5cE9c09D00c92A463C3",
-    "0x4200000000000000000000000000000000000006"
-])
-strategy_cooldowns = {}
-_scan_counter = 0
-
-ENV_PRIV_KEY = os.environ.get("KEEPER_PRIVATE_KEY", "").strip()
-ENV_GUARD_ADDR = os.environ.get("KEEPER_GUARD_ADDRESS", DEFAULT_GUARD_ADDR).strip()
-ENV_RPC_URL = os.environ.get("KEEPER_RPC_URL", "https://mainnet.base.org").strip()
-ENV_CHAIN = os.environ.get("KEEPER_CHAIN", "base").strip().lower()
-ENV_LIVE = os.environ.get("KEEPER_LIVE_ARMED", "true").strip().lower() in ("true", "1", "yes")
-
-ENV_GATE_KEY = os.environ.get("GATE_API_KEY", "").strip()
-ENV_GATE_SECRET = os.environ.get("GATE_API_SECRET", "").strip()
 
 DEFAULT_STATE = {
-    "version": "v4.0 • Morpho Zero-Fee Flash Loan Liquidator + Dual-Core Master",
-    "chain": ENV_CHAIN if ENV_CHAIN in CHAIN_CONFIGS else "base",
-    "rpc_url": ENV_RPC_URL,
-    "wallet_address": DEFAULT_WALLET_ADDR,
-    "private_key": ENV_PRIV_KEY,
-    "guard_contract": ENV_GUARD_ADDR,
-    "live_armed": bool(ENV_PRIV_KEY and ENV_GUARD_ADDR and ENV_LIVE),
-    "min_profit_usd": 0.02,
-    "eth_price_usd": 2294.16,
-    "native_eth_balance": 0.0,
-    "weth_balance": 0.0,
-    "aero_balance": 0.0,
-    "well_balance": 0.0,
-    "usdc_balance": 0.0,
-    "mweth_shares": 0.0,
-    "mweth_assets_wei": 0,
-    "mweth_assets_eth": 0.0,
-    "mweth_principal_wei": INITIAL_DEPOSIT_WEI_BASELINE,
-    "mweth_earned_wei": 0,
-    "mweth_earned_eth": 0.0,
-    "mweth_earned_usd": 0.0,
-    "position_pnl_usd": 0.0,
-    "morpho_flash_pool_usdc": 0.0,
-    "borrowers_tracked": 0,
-    "underwater_found": 0,
-    "total_bounties_won": 0,
-    "realized_profit_usd": 0.0,
-    "vaults_monitored": 0,
-    # Core 2: Gate.io v4 Spot Volatility Skimmer State
-    "gate_api_key": ENV_GATE_KEY,
-    "gate_api_secret": ENV_GATE_SECRET,
-    "skim_armed": False,
-    "skim_pair": "QNT_USDT",
-    "skim_order_usd": 25.0,
-    "skim_dip_pct": 1.2,
-    "skim_tp_pct": 1.3,
-    "gate_usdt_balance": 0.0,
-    "gate_qnt_balance": 0.0,
-    "gate_ltc_balance": 0.0,
-    "qnt_price": 0.0,
-    "ltc_price": 0.0,
-    "skim_anchor_price": 0.0,
-    "skim_active_entry": 0.0,
-    "skim_active_amount": 0.0,
-    "skim_flips_won": 0,
-    "skim_realized_usd": 0.0,
-    "last_scan_hms": "--:--:--",
+    "mode": "LIVE",
+    "fee_buffer_pct": 0.25,
+    "api_key": os.environ.get("GATE_API_KEY", "").strip(),
+    "api_secret": os.environ.get("GATE_API_SECRET", "").strip(),
+    "api_connected": False,
+    "api_status_msg": "Not Connected — Paste Keys & Tap Sync",
+    "slots": {},
+    "paper_slots": {},
+    "paper_bankroll_usdt": 100.0,
+    "paper_free_usdt": 100.0,
+    "paper_skimmed_usdt": 0.0,
+    "paper_skim_count": 0,
+    "live_skimmed_usdt": 0.0,
+    "live_skim_count": 0,
+    "usdt_balance": 0.0,
     "last_scan_ms": 0,
-    "live_opportunities": [],
-    "harvest_ledger": [
-        {
-            "mode": "YIELD ACTIVE",
-            "vault": "Moonwell Flagship ETH (mwETH)",
-            "strategy": "0xa0E4...0ff1",
-            "bounty_usd": 5.46,
-            "gas_usd": 0.002,
-            "net_usd": 5.46,
-            "tx_url": f"https://basescan.org/address/{DEFAULT_WALLET_ADDR}",
-            "time": "00:06:49"
-        }
-    ],
-    "logs": [
-        f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] "
-        "KeeperPulse v4.0 Master Engine Online: Morpho Zero-Fee Flash Loan Liquidator + Moonwell Wei Tracker + Gate.io Skimmer Ready."
-    ]
+    "cycle_count": 0,
+    "last_update": "--:--:--",
+    "last_worker_heartbeat": 0.0,
+    "skim_ledger": [],
+    "paper_ledger": [],
+    "logs": []
 }
 
+state_lock = threading.Lock()
+cycle_lock = threading.Lock()
+worker_started = False
+STATE = DEFAULT_STATE.copy()
 
-def now_hms():
-    return datetime.now(timezone.utc).strftime("%H:%M:%S")
+
+def normalize_pair(raw_pair):
+    p = (raw_pair or "").strip().upper().replace("/", "_").replace("-", "_").replace(" ", "")
+    if not p:
+        return ""
+    if "_" not in p:
+        if p.endswith("USDT") and len(p) > 4:
+            p = p[:-4] + "_USDT"
+        else:
+            p = p + "_USDT"
+    return p
 
 
 def load_state():
-    merged = json.loads(json.dumps(DEFAULT_STATE))
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if isinstance(data, dict):
-                    merged.update(data)
-        except Exception:
-            pass
-    if ENV_PRIV_KEY and not merged.get("private_key"):
-        merged["private_key"] = ENV_PRIV_KEY
-    if ENV_GUARD_ADDR and not merged.get("guard_contract"):
-        merged["guard_contract"] = ENV_GUARD_ADDR
-    if ENV_RPC_URL and ENV_RPC_URL != "https://mainnet.base.org":
-        merged["rpc_url"] = ENV_RPC_URL
-    if ENV_GATE_KEY and not merged.get("gate_api_key"):
-        merged["gate_api_key"] = ENV_GATE_KEY
-    if ENV_GATE_SECRET and not merged.get("gate_api_secret"):
-        merged["gate_api_secret"] = ENV_GATE_SECRET
-    if not merged.get("wallet_address"):
-        merged["wallet_address"] = DEFAULT_WALLET_ADDR
-    if int(merged.get("mweth_principal_wei") or 0) <= 0:
-        merged["mweth_principal_wei"] = INITIAL_DEPOSIT_WEI_BASELINE
-    merged["version"] = "v4.0 • Morpho Zero-Fee Flash Loan Liquidator + Dual-Core Master"
-    return merged
+    global STATE
+    for fn in [STATE_FILE, "vaultskimmer_v5_6_state.json", "vaultskimmer_v5_5_state.json", "vaultskimmer_v5_4_state.json"]:
+        if os.path.exists(fn):
+            try:
+                with open(fn, "r") as f:
+                    saved = json.load(f)
+                    saved_key = (saved.get("api_key") or "").strip()
+                    saved_sec = (saved.get("api_secret") or "").strip()
+                    STATE.update(saved)
+                    if saved_key:
+                        STATE["api_key"] = saved_key
+                    if saved_sec:
+                        STATE["api_secret"] = saved_sec
+                    if "slots" not in STATE or not isinstance(STATE["slots"], dict):
+                        STATE["slots"] = {}
+                    if "paper_slots" not in STATE or not isinstance(STATE["paper_slots"], dict):
+                        STATE["paper_slots"] = {}
+
+                    # Auto-heal the $0.00 unfilled PEPE phantom skim from 16:26:15!
+                    pepe_slot = STATE["slots"].get("PEPE_USDT")
+                    if pepe_slot and pepe_slot.get("entry_price") == 0.00000526 and pepe_slot.get("slot_skimmed_usdt") == 0.01:
+                        pepe_slot["entry_price"] = 0.00000516
+                        pepe_slot["actual_cost_usdt"] = 10.35
+                        pepe_slot["slot_skimmed_usdt"] = 0.0
+                        pepe_slot["slot_skim_count"] = 0
+                        STATE["live_skimmed_usdt"] = max(0.0, round(float(STATE.get("live_skimmed_usdt", 0.0)) - 0.01, 4))
+                        STATE["live_skim_count"] = max(0, int(STATE.get("live_skim_count", 0)) - 1)
+                        STATE["skim_ledger"] = [
+                            item for item in STATE.get("skim_ledger", [])
+                            if "($0.00)" not in str(item.get("sell_px", ""))
+                        ]
+                break
+            except Exception as e:
+                add_log(f"State load notice: {e}")
 
 
 def save_state():
-    with state_lock:
-        snapshot = json.loads(json.dumps(STATE))
     try:
-        tmp = f"{STATE_FILE}.tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(snapshot, f, indent=2)
-        os.replace(tmp, STATE_FILE)
+        tmp_file = STATE_FILE + ".tmp"
+        with open(tmp_file, "w") as f:
+            json.dump(STATE, f, indent=2)
+        os.replace(tmp_file, STATE_FILE)
     except Exception:
         pass
-
-
-STATE = load_state()
 
 
 def add_log(msg):
-    with state_lock:
-        STATE["logs"].insert(0, f"[{now_hms()}] {msg}")
-        if len(STATE["logs"]) > 100:
-            STATE["logs"] = STATE["logs"][:100]
+    ts = datetime.utcnow().strftime("%H:%M:%S")
+    entry = f"[{ts}] {msg}"
+    STATE["logs"].insert(0, entry)
+    STATE["logs"] = STATE["logs"][:100]
 
 
-# ==============================================================================
-# 4. CORE 2: GATE.IO v4 SPOT VOLATILITY SKIMMER (QNT/USDT & LTC/USDT)
-# ==============================================================================
-def gate_sign_headers(method, url_path, query_string="", payload_string=""):
-    with state_lock:
-        api_key = (STATE.get("gate_api_key") or "").strip()
-        api_secret = (STATE.get("gate_api_secret") or "").strip()
+def gate_sign(method, url, query_string="", body_string="", custom_key=None, custom_secret=None):
+    key = (custom_key if custom_key else STATE.get("api_key", "")).strip()
+    secret = (custom_secret if custom_secret else STATE.get("api_secret", "")).strip()
     t = str(int(time.time()))
-    body_hash = hashlib.sha512(payload_string.encode("utf-8")).hexdigest()
-    sign_str = f"{method.upper()}\n{GATE_API_PREFIX}{url_path}\n{query_string}\n{body_hash}\n{t}"
-    sig = hmac.new(api_secret.encode("utf-8"), sign_str.encode("utf-8"), hashlib.sha512).hexdigest()
+    hashed_payload = hashlib.sha512(body_string.encode("utf-8")).hexdigest()
+    s = f"{method}\n{url}\n{query_string}\n{hashed_payload}\n{t}"
+    sign = hmac.new(secret.encode("utf-8"), s.encode("utf-8"), hashlib.sha512).hexdigest()
     return {
         "Accept": "application/json",
         "Content-Type": "application/json",
-        "KEY": api_key,
+        "KEY": key,
         "Timestamp": t,
-        "SIGN": sig
+        "SIGN": sign
     }
 
 
-def update_market_prices():
-    try:
-        r = requests.get(f"{GATE_API_HOST}{GATE_API_PREFIX}/spot/tickers", timeout=5)
-        if r.status_code == 200 and isinstance(r.json(), list):
-            for item in r.json():
-                cp = item.get("currency_pair")
-                if cp == "ETH_USDT":
-                    px = float(item.get("last") or 0.0)
-                    if px > 100:
-                        with state_lock:
-                            STATE["eth_price_usd"] = round(px, 2)
-                elif cp == "QNT_USDT":
-                    with state_lock:
-                        STATE["qnt_price"] = round(float(item.get("last") or 0.0), 3)
-                elif cp == "LTC_USDT":
-                    with state_lock:
-                        STATE["ltc_price"] = round(float(item.get("last") or 0.0), 3)
-    except Exception:
-        pass
-    return STATE.get("eth_price_usd", 2294.16)
+def get_pair_meta(pair):
+    now = time.time()
+    cached = PAIR_META_CACHE.get(pair)
+    if not cached or (now - cached["ts"] > 3600):
+        p_resp = HTTP_SESSION.get(
+            f"{GATE_HOST}{GATE_PREFIX}/spot/currency_pairs/{pair}",
+            timeout=5
+        )
+        if p_resp.status_code != 200:
+            raise ValueError(f"Token pair '{pair}' not found on Gate.io")
+        p_info = p_resp.json()
+        cached = {
+            "amount_prec": int(p_info.get("amount_precision", 4)),
+            "price_prec": int(p_info.get("precision", 8)),
+            "min_quote": float(p_info.get("min_quote_amount", 1.0)),
+            "min_base": float(p_info.get("min_base_amount", 0.0001)),
+            "ts": now
+        }
+        PAIR_META_CACHE[pair] = cached
+    return cached
 
 
-def sync_gate_spot_balances():
-    with state_lock:
-        api_key = (STATE.get("gate_api_key") or "").strip()
-        api_secret = (STATE.get("gate_api_secret") or "").strip()
-    if not api_key or not api_secret:
-        return False
-
-    try:
-        headers = gate_sign_headers("GET", "/spot/accounts")
-        r = requests.get(f"{GATE_API_HOST}{GATE_API_PREFIX}/spot/accounts", headers=headers, timeout=6)
-        if r.status_code == 200 and isinstance(r.json(), list):
-            usdt_b, qnt_b, ltc_b = 0.0, 0.0, 0.0
-            for acc in r.json():
-                curr = acc.get("currency")
-                avail = float(acc.get("available") or 0.0)
-                if curr == "USDT":
-                    usdt_b = avail
-                elif curr == "QNT":
-                    qnt_b = avail
-                elif curr == "LTC":
-                    ltc_b = avail
-            with state_lock:
-                STATE["gate_usdt_balance"] = round(usdt_b, 2)
-                STATE["gate_qnt_balance"] = round(qnt_b, 5)
-                STATE["gate_ltc_balance"] = round(ltc_b, 5)
-            return True
-    except Exception as e:
-        logger.debug(f"Gate balance sync notice: {e}")
-    return False
+def fetch_batch_tickers(pairs):
+    if not pairs:
+        return {}
+    r = HTTP_SESSION.get(f"{GATE_HOST}{GATE_PREFIX}/spot/tickers", timeout=6)
+    r.raise_for_status()
+    all_data = r.json()
+    wanted = set(pairs)
+    result = {}
+    for t in all_data:
+        cp = t.get("currency_pair")
+        if cp in wanted:
+            last = float(t["last"])
+            high_24 = float(t.get("high_24h") or last)
+            low_24 = float(t.get("low_24h") or last)
+            rng_pct = ((high_24 - low_24) / low_24 * 100.0) if low_24 > 0 else 0.0
+            result[cp] = {
+                "last": last,
+                "high_24h": high_24,
+                "low_24h": low_24,
+                "change_24h": float(t.get("change_percentage") or 0.0),
+                "range_24h_pct": round(rng_pct, 2)
+            }
+    return result
 
 
-def place_gate_spot_limit_order(pair, side, amount_coin, price_usd):
-    body_dict = {
+def fetch_all_spot_balances(custom_key=None, custom_secret=None):
+    url = f"{GATE_PREFIX}/spot/accounts"
+    headers = gate_sign("GET", url, "", "", custom_key, custom_secret)
+    r = HTTP_SESSION.get(f"{GATE_HOST}{url}", headers=headers, timeout=5)
+    if r.status_code != 200:
+        try:
+            err_msg = r.json().get("message", r.text)
+        except Exception:
+            err_msg = r.text
+        raise ValueError(f"Gate.io HTTP {r.status_code}: {err_msg}")
+    accounts = r.json()
+    bal_map = {}
+    for acc in accounts:
+        curr = acc.get("currency")
+        if curr:
+            bal_map[curr] = float(acc.get("available", 0.0))
+    return bal_map
+
+
+def format_dec(val, precision, round_mode=ROUND_DOWN):
+    q = Decimal("10") ** (-precision)
+    return str(Decimal(str(val)).quantize(q, rounding=round_mode))
+
+
+def calc_fee_protected_buy_amt(budget_usdt, price, amt_prec):
+    raw_units = budget_usdt / price
+    if amt_prec == 0:
+        target_int = int(Decimal(str(raw_units)).quantize(Decimal("1"), rounding=ROUND_DOWN))
+        return str(max(1, target_int))
+    else:
+        padded = raw_units * 1.0012
+        return format_dec(padded, amt_prec, ROUND_DOWN)
+
+
+def place_gate_order(pair, side, amount_str, price_str):
+    url = f"{GATE_PREFIX}/spot/orders"
+    body = {
         "currency_pair": pair,
         "type": "limit",
         "account": "spot",
         "side": side,
-        "amount": f"{amount_coin:.5f}",
-        "price": f"{price_usd:.2f}",
-        "time_in_force": "gtc"
+        "amount": amount_str,
+        "price": price_str,
+        "time_in_force": "ioc"
     }
-    payload = json.dumps(body_dict)
-    headers = gate_sign_headers("POST", "/spot/orders", "", payload)
-    r = requests.post(f"{GATE_API_HOST}{GATE_API_PREFIX}/spot/orders", headers=headers, data=payload, timeout=8)
-    return r.status_code in (200, 201), r.json()
+    body_str = json.dumps(body)
+    headers = gate_sign("POST", url, "", body_str)
+    r = HTTP_SESSION.post(f"{GATE_HOST}{url}", headers=headers, data=body_str, timeout=7)
+    return r.status_code, r.json()
 
 
-def run_spot_volatility_skimmer_step():
-    sync_gate_spot_balances()
-    with state_lock:
-        pair = STATE.get("skim_pair", "QNT_USDT")
-        live_price = STATE.get("qnt_price", 0.0) if pair == "QNT_USDT" else STATE.get("ltc_price", 0.0)
-        anchor = float(STATE.get("skim_anchor_price") or 0.0)
-        active_entry = float(STATE.get("skim_active_entry") or 0.0)
-        active_amt = float(STATE.get("skim_active_amount") or 0.0)
-        dip_pct = float(STATE.get("skim_dip_pct") or 1.2)
-        tp_pct = float(STATE.get("skim_tp_pct") or 1.3)
-        order_usd = float(STATE.get("skim_order_usd") or 25.0)
-        skim_armed = bool(STATE.get("skim_armed", False))
-        has_keys = bool(STATE.get("gate_api_key") and STATE.get("gate_api_secret"))
-        usdt_avail = float(STATE.get("gate_usdt_balance") or 0.0)
+# =========================================================================
+# ENGINE 1: PAPER STUDY LAB SLOT PROCESSOR (Runs 100% Independently on $100)
+# =========================================================================
+def process_paper_slot(pair, slot, fee_buf, ticker_map):
+    principal = float(slot["principal_usdt"])
+    skim_pct = float(slot["skim_target_pct"])
+    stop_reset_pct = float(slot.get("stop_reset_pct", 3.0))
+    pullback_pct = float(slot.get("rebuy_pullback_pct", 0.30))
 
-    if live_price <= 0:
+    tk = ticker_map.get(pair)
+    if not tk:
         return
 
-    if anchor <= 0:
-        with state_lock:
-            STATE["skim_anchor_price"] = live_price
-        return
+    meta = get_pair_meta(pair)
+    price = tk["last"]
+    px_prec = meta["price_prec"]
 
-    if active_entry <= 0 and live_price > anchor:
-        with state_lock:
-            STATE["skim_anchor_price"] = round(anchor * 0.85 + live_price * 0.15, 3)
-            anchor = STATE["skim_anchor_price"]
+    slot["last_price"] = price
+    slot["price_prec"] = px_prec
+    slot["high_24h"] = tk["high_24h"]
+    slot["low_24h"] = tk["low_24h"]
+    slot["change_24h_pct"] = tk["change_24h"]
+    slot["range_24h_pct"] = tk.get("range_24h_pct", 0.0)
 
-    if active_entry <= 0:
-        buy_trigger = anchor * (1.0 - (dip_pct / 100.0))
-        if live_price <= buy_trigger:
-            coin_amt = round(order_usd / live_price, 5)
-            if skim_armed and has_keys and usdt_avail >= order_usd:
-                ok, resp = place_gate_spot_limit_order(pair, "buy", coin_amt, live_price)
-                if ok:
-                    with state_lock:
-                        STATE["skim_active_entry"] = live_price
-                        STATE["skim_active_amount"] = coin_amt
-                    add_log(f"⚡ [GATE.IO LIVE BUY] Bought {coin_amt:.4f} {pair} @ ${live_price:.2f} (-{dip_pct}% Dip)!")
-                    sync_gate_spot_balances()
-                else:
-                    add_log(f"⚠️ Gate.io Buy notice: {resp}")
-            else:
-                with state_lock:
-                    STATE["skim_active_entry"] = live_price
-                    STATE["skim_active_amount"] = coin_amt
-                mode_tag = "LIVE-READY SIM" if not skim_armed else "NO-USDT SIM"
-                add_log(f"📉 [{mode_tag} DIP ENTRY] Triggered {pair} Buy @ ${live_price:.2f} (Target Exit: +{tp_pct}%)")
+    effective_gain_pct = skim_pct + fee_buf
+    last_sell_px = float(slot.get("last_skim_sell_price", 0.0))
+    if last_sell_px > 0 and pullback_pct > 0:
+        rebuy_px = last_sell_px * (1.0 - (pullback_pct / 100.0))
     else:
-        sell_trigger = active_entry * (1.0 + (tp_pct / 100.0))
-        if live_price >= sell_trigger:
-            gross_profit = (live_price - active_entry) * active_amt
-            fee_usd = (order_usd * 0.002)
-            net_profit = max(0.01, gross_profit - fee_usd)
-
-            if skim_armed and has_keys:
-                ok, _ = place_gate_spot_limit_order(pair, "sell", active_amt, live_price)
-                mode_label = "SPOT SKIM WON" if ok else "SIM SKIM FLIP"
-            else:
-                mode_label = "SIM SKIM FLIP"
-
-            with state_lock:
-                STATE["skim_flips_won"] = int(STATE.get("skim_flips_won", 0)) + 1
-                STATE["skim_realized_usd"] = round(float(STATE.get("skim_realized_usd", 0.0)) + net_profit, 4)
-                STATE["skim_active_entry"] = 0.0
-                STATE["skim_active_amount"] = 0.0
-                STATE["skim_anchor_price"] = live_price
-                STATE["harvest_ledger"].insert(0, {
-                    "mode": mode_label,
-                    "vault": f"Gate.io {pair} Skim",
-                    "strategy": f"Buy ${active_entry:.2f} -> Sell ${live_price:.2f}",
-                    "bounty_usd": round(gross_profit, 4),
-                    "gas_usd": round(fee_usd, 4),
-                    "net_usd": round(net_profit, 4),
-                    "tx_url": "https://www.gate.io/trade/" + pair,
-                    "time": now_hms()
-                })
-            add_log(f"💰 [{mode_label}] Flipped {pair} @ ${live_price:.2f} for +${net_profit:.3f} Net Profit!")
-
-
-# ==============================================================================
-# 5. CORE 1: MORPHO FLASH-LOAN LIQUIDATOR & MOONWELL WEI YIELD ENGINE
-# ==============================================================================
-def get_web3():
-    with state_lock:
-        chain_key = STATE.get("chain", "base")
-        rpc_url = (STATE.get("rpc_url") or CHAIN_CONFIGS[chain_key]["default_rpc"]).strip()
-    w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 10}))
-    return w3, chain_key, CHAIN_CONFIGS[chain_key]
-
-
-def sync_wallet_balances():
-    w3, chain_key, cfg = get_web3()
-    with state_lock:
-        priv = (STATE.get("private_key") or "").strip()
-        addr = (STATE.get("wallet_address") or DEFAULT_WALLET_ADDR).strip()
-        eth_px = float(STATE.get("eth_price_usd") or 2294.16)
-
-    if priv:
-        try:
-            acct = Account.from_key(priv if priv.startswith("0x") else f"0x{priv}")
-            addr = acct.address
-            with state_lock:
-                STATE["wallet_address"] = addr
-        except Exception:
-            pass
-
-    if not addr or not Web3.is_address(addr):
-        return False, "No wallet address."
-
-    checksum_addr = Web3.to_checksum_address(addr)
-    try:
-        native_wei = w3.eth.get_balance(checksum_addr)
-        weth_c = w3.eth.contract(address=Web3.to_checksum_address(cfg["wrapped_native"]), abi=WETH_ABI)
-        aero_c = w3.eth.contract(address=Web3.to_checksum_address(cfg["aero_token"]), abi=WETH_ABI)
-        usdc_c = w3.eth.contract(address=Web3.to_checksum_address(cfg["usdc_token"]), abi=WETH_ABI)
-
-        weth_wei = weth_c.functions.balanceOf(checksum_addr).call()
-        aero_wei = aero_c.functions.balanceOf(checksum_addr).call()
-        usdc_raw = usdc_c.functions.balanceOf(checksum_addr).call()
-
-        mweth_shares_wei = 0
-        mweth_assets_wei = 0
-        well_wei = 0
-        morpho_usdc_pool = 0.0
-        if chain_key == "base":
-            mw_vault = w3.eth.contract(
-                address=Web3.to_checksum_address(MOONWELL_MWETH_VAULT),
-                abi=ERC4626_VAULT_ABI
-            )
-            mweth_shares_wei = mw_vault.functions.balanceOf(checksum_addr).call()
-            if mweth_shares_wei > 0:
-                mweth_assets_wei = mw_vault.functions.convertToAssets(mweth_shares_wei).call()
-            well_c = w3.eth.contract(address=Web3.to_checksum_address(WELL_TOKEN_BASE), abi=WETH_ABI)
-            well_wei = well_c.functions.balanceOf(checksum_addr).call()
-            # Check live zero-fee flash loan liquidity inside Morpho Blue on Base
-            morpho_usdc_raw = usdc_c.functions.balanceOf(Web3.to_checksum_address(MORPHO_BLUE_BASE)).call()
-            morpho_usdc_pool = round(morpho_usdc_raw / 1e6, 2)
-
-        assets_eth = float(Web3.from_wei(mweth_assets_wei, "ether"))
-        with state_lock:
-            STATE["native_eth_balance"] = round(float(Web3.from_wei(native_wei, "ether")), 6)
-            STATE["weth_balance"] = round(float(Web3.from_wei(weth_wei, "ether")), 6)
-            STATE["aero_balance"] = round(float(Web3.from_wei(aero_wei, "ether")), 4)
-            STATE["well_balance"] = round(float(Web3.from_wei(well_wei, "ether")), 4)
-            STATE["usdc_balance"] = round(usdc_raw / 1e6, 4)
-            STATE["morpho_flash_pool_usdc"] = morpho_usdc_pool
-            STATE["mweth_shares"] = round(float(Web3.from_wei(mweth_shares_wei, "ether")), 8)
-            STATE["mweth_assets_wei"] = int(mweth_assets_wei)
-            STATE["mweth_assets_eth"] = round(assets_eth, 10)
-
-            principal_wei = int(STATE.get("mweth_principal_wei") or INITIAL_DEPOSIT_WEI_BASELINE)
-            if mweth_assets_wei > 0:
-                share_growth_wei = max(0, int(mweth_assets_wei) - int(mweth_shares_wei))
-                baseline_growth_wei = max(0, int(mweth_assets_wei) - principal_wei)
-                earned_wei = max(baseline_growth_wei, share_growth_wei)
-            else:
-                earned_wei = 0
-
-            earned_eth = float(Web3.from_wei(earned_wei, "ether"))
-            current_vault_usd = assets_eth * eth_px
-            pnl_usd = max(0.0, current_vault_usd - INITIAL_DEPOSIT_USD_BASELINE)
-
-            STATE["mweth_earned_wei"] = int(earned_wei)
-            STATE["mweth_earned_eth"] = round(earned_eth, 10)
-            STATE["mweth_earned_usd"] = round(earned_eth * eth_px, 6)
-            STATE["position_pnl_usd"] = round(pnl_usd, 4)
-        return True, "Synced"
-    except Exception as e:
-        return False, str(e)
-
-
-def simulate_morpho_flash_loan_check():
-    """
-    Runs a 100% free on-chain EVM simulation (`eth_call`) testing Morpho Blue's
-    0% fee flash-loan liquidity pool on Base Mainnet.
-    """
-    w3, chain_key, cfg = get_web3()
-    if chain_key != "base":
-        return False, "Switch to Base Mainnet to test Morpho Blue Flash Loans."
-
-    try:
-        usdc_c = w3.eth.contract(address=Web3.to_checksum_address(USDC_TOKEN_BASE), abi=WETH_ABI)
-        weth_c = w3.eth.contract(address=Web3.to_checksum_address(BASE_WETH), abi=WETH_ABI)
-        avail_usdc = usdc_c.functions.balanceOf(Web3.to_checksum_address(MORPHO_BLUE_BASE)).call() / 1e6
-        avail_weth = float(Web3.from_wei(weth_c.functions.balanceOf(Web3.to_checksum_address(MORPHO_BLUE_BASE)).call(), "ether"))
-
-        msg = (
-            f"⚡ Morpho Blue Zero-Fee Flash Pool Verified on Base! "
-            f"Instant 0%-Fee Liquidity Available: ${avail_usdc:,.2f} USDC + {avail_weth:,.2f} WETH. "
-            f"Your KeeperGuardV3 contract can borrow up to $50,000+ per block with $0 collateral."
-        )
-        add_log(msg)
-        return True, msg
-    except Exception as e:
-        return False, f"Flash pool check notice: {e}"
-
-
-def discover_and_scan_moonwell_borrowers(w3):
-    """
-    Discovers active Moonwell borrowers from recent Borrow/Transfer logs on Base
-    and batch-checks `getAccountLiquidity(account)` via Multicall3 for `shortfall > 0`.
-    """
-    global monitored_borrowers
-    try:
-        latest_block = w3.eth.block_number
-        from_block = max(1, latest_block - 90)
-        # Discover borrower addresses interacting with Moonwell mUSDC or mWETH
-        logs = w3.eth.get_logs({
-            "fromBlock": from_block,
-            "toBlock": latest_block,
-            "address": [
-                Web3.to_checksum_address(MOONWELL_MUSDC),
-                Web3.to_checksum_address(MOONWELL_MWETH)
-            ]
-        })
-        for lg in logs[:40]:
-            topics = lg.get("topics", [])
-            if len(topics) >= 2:
-                raw_hex = topics[1].hex()[-40:]
-                cand = "0x" + raw_hex
-                if Web3.is_address(cand) and int(raw_hex, 16) != 0:
-                    monitored_borrowers.add(Web3.to_checksum_address(cand))
-    except Exception:
-        pass
-
-    borrower_list = list(monitored_borrowers)[:60]
-    with state_lock:
-        STATE["borrowers_tracked"] = len(borrower_list)
-
-    if not borrower_list:
-        return []
-
-    multicall = w3.eth.contract(
-        address=Web3.to_checksum_address(MULTICALL3_ADDRESS),
-        abi=MULTICALL3_ABI
-    )
-    comp_addr = Web3.to_checksum_address(MOONWELL_COMPTROLLER)
-    calls = []
-    for b_addr in borrower_list:
-        padded = b_addr.lower().replace("0x", "").rjust(64, "0")
-        calls.append((comp_addr, bytes.fromhex(SEL_GET_ACCT_LIQUIDITY[2:] + padded)))
-
-    underwater = []
-    try:
-        results = multicall.functions.tryAggregate(False, calls).call()
-        for idx, (ok, rdata) in enumerate(results):
-            if ok and rdata and len(rdata) >= 96:
-                err_code = int.from_bytes(rdata[0:32], byteorder="big")
-                shortfall_wei = int.from_bytes(rdata[64:96], byteorder="big")
-                if err_code == 0 and shortfall_wei > 0:
-                    shortfall_usd = float(Web3.from_wei(shortfall_wei, "ether"))
-                    if shortfall_usd >= 0.25:
-                        underwater.append({
-                            "borrower": borrower_list[idx],
-                            "shortfall_usd": round(shortfall_usd, 4),
-                            "est_bonus_usd": round(shortfall_usd * 0.05, 4)
-                        })
-    except Exception:
-        pass
-
-    with state_lock:
-        STATE["underwater_found"] = len(underwater)
-    return underwater
-
-
-def compile_and_deploy_keeper_guard():
-    with state_lock:
-        priv = (STATE.get("private_key") or "").strip()
-    if not priv:
-        return False, "Paste your Keeper Wallet Private Key and click 'Save & Sync All Settings' first."
-
-    w3, chain_key, cfg = get_web3()
-    try:
-        acct = Account.from_key(priv if priv.startswith("0x") else f"0x{priv}")
-        with state_lock:
-            STATE["wallet_address"] = acct.address
-    except Exception as e:
-        return False, f"Invalid Private Key: {e}"
-
-    try:
-        bal_wei = w3.eth.get_balance(acct.address)
-        if bal_wei < Web3.to_wei(0.000015, "ether"):
-            return False, "Insufficient ETH in wallet to deploy KeeperGuardV3."
-
-        add_log("⚙️ Compiling Flash-Loan KeeperGuardV3.sol (Morpho Callback + Multi-Token Guard)...")
-        import solcx
-        installed = [str(v) for v in solcx.get_installed_solc_versions()]
-        if not any("0.8.20" in v for v in installed):
-            solcx.install_solc("0.8.20")
-        solcx.set_solc_version("0.8.20")
-
-        compiled = solcx.compile_source(
-            KEEPER_GUARD_SOL_SOURCE,
-            output_values=["abi", "bin"],
-            optimize=True,
-            optimize_runs=200
-        )
-        _, contract_interface = next(
-            (k, v) for k, v in compiled.items() if k.endswith(":KeeperGuard")
-        )
-        ContractFactory = w3.eth.contract(
-            abi=contract_interface["abi"],
-            bytecode=contract_interface["bin"]
-        )
-        gas_price_wei = w3.eth.gas_price
-        nonce = w3.eth.get_transaction_count(acct.address)
-        est_gas = ContractFactory.constructor().estimate_gas({"from": acct.address})
-        tx = ContractFactory.constructor().build_transaction({
-            "chainId": cfg["chain_id"],
-            "from": acct.address,
-            "nonce": nonce,
-            "gas": int(est_gas * 1.25),
-            "maxFeePerGas": int(gas_price_wei * 1.25),
-            "maxPriorityFeePerGas": int(gas_price_wei * 0.10)
-        })
-        signed = w3.eth.account.sign_transaction(tx, private_key=acct.key)
-        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=45)
-        if receipt and receipt.status == 1 and receipt.contractAddress:
-            guard_addr = Web3.to_checksum_address(receipt.contractAddress)
-            with state_lock:
-                STATE["guard_contract"] = guard_addr
-            save_state()
-            sync_wallet_balances()
-            msg = f"✅ Flash-Loan KeeperGuardV3 Deployed at {guard_addr}! Morpho 0%-Fee Flash Callbacks Active."
-            add_log(msg)
-            return True, msg
-        return False, "Deployment transaction reverted."
-    except Exception as e:
-        return False, f"Deploy error: {e}"
-
-
-def unwrap_weth_to_eth():
-    with state_lock:
-        priv = (STATE.get("private_key") or "").strip()
-    if not priv:
-        return False, "Paste your Private Key and click Save first."
-    w3, _, cfg = get_web3()
-    try:
-        acct = Account.from_key(priv if priv.startswith("0x") else f"0x{priv}")
-        weth = w3.eth.contract(address=Web3.to_checksum_address(cfg["wrapped_native"]), abi=WETH_ABI)
-        weth_wei = weth.functions.balanceOf(acct.address).call()
-        if weth_wei <= 0:
-            return False, "Your WETH balance is currently 0.000000 WETH."
-        gas_price_wei = w3.eth.gas_price
-        nonce = w3.eth.get_transaction_count(acct.address)
-        tx = weth.functions.withdraw(weth_wei).build_transaction({
-            "chainId": cfg["chain_id"],
-            "from": acct.address,
-            "nonce": nonce,
-            "gas": 60000,
-            "maxFeePerGas": int(gas_price_wei * 1.20),
-            "maxPriorityFeePerGas": int(gas_price_wei * 0.10)
-        })
-        signed = w3.eth.account.sign_transaction(tx, private_key=acct.key)
-        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=30)
-        if receipt and receipt.status == 1:
-            sync_wallet_balances()
-            amt = float(Web3.from_wei(weth_wei, "ether"))
-            msg = f"✅ Unwrapped {amt:.6f} WETH into Native ETH!"
-            add_log(msg)
-            return True, msg
-        return False, "Unwrap failed."
-    except Exception as e:
-        return False, f"Unwrap error: {e}"
-
-
-def deposit_into_moonwell_yield():
-    with state_lock:
-        priv = (STATE.get("private_key") or "").strip()
-    if not priv:
-        return False, "Paste your Keeper Wallet Private Key first."
-
-    w3, chain_key, _ = get_web3()
-    if chain_key != "base":
-        return False, "Switch network to Base Mainnet to use Moonwell Flagship ETH."
-
-    try:
-        acct = Account.from_key(priv if priv.startswith("0x") else f"0x{priv}")
-        weth_addr = Web3.to_checksum_address(BASE_WETH)
-        vault_addr = Web3.to_checksum_address(MOONWELL_MWETH_VAULT)
-        weth_c = w3.eth.contract(address=weth_addr, abi=WETH_ABI)
-        vault_c = w3.eth.contract(address=vault_addr, abi=ERC4626_VAULT_ABI)
-
-        native_wei = w3.eth.get_balance(acct.address)
-        weth_wei = weth_c.functions.balanceOf(acct.address).call()
-        gas_reserve_wei = Web3.to_wei(0.00050, "ether")
-
-        if native_wei > gas_reserve_wei:
-            wrap_wei = native_wei - gas_reserve_wei
-            gas_price_wei = w3.eth.gas_price
-            nonce = w3.eth.get_transaction_count(acct.address)
-            tx1 = weth_c.functions.deposit().build_transaction({
-                "chainId": 8453,
-                "from": acct.address,
-                "value": wrap_wei,
-                "nonce": nonce,
-                "gas": 55000,
-                "maxFeePerGas": int(gas_price_wei * 1.20),
-                "maxPriorityFeePerGas": int(gas_price_wei * 0.10)
-            })
-            signed1 = w3.eth.account.sign_transaction(tx1, private_key=acct.key)
-            w3.eth.wait_for_transaction_receipt(w3.eth.send_raw_transaction(signed1.raw_transaction), timeout=30)
-            weth_wei = weth_c.functions.balanceOf(acct.address).call()
-
-        if weth_wei <= Web3.to_wei(0.00005, "ether"):
-            return (
-                False,
-                "Your spare ETH (0.002425 ETH) is already compounding inside the Moonwell Vault! "
-                "(0.000547 ETH is kept in your wallet for gas)."
-            )
-
-        allowance = weth_c.functions.allowance(acct.address, vault_addr).call()
-        if allowance < weth_wei:
-            gas_price_wei = w3.eth.gas_price
-            nonce = w3.eth.get_transaction_count(acct.address)
-            tx2 = weth_c.functions.approve(vault_addr, 2**256 - 1).build_transaction({
-                "chainId": 8453,
-                "from": acct.address,
-                "nonce": nonce,
-                "gas": 65000,
-                "maxFeePerGas": int(gas_price_wei * 1.20),
-                "maxPriorityFeePerGas": int(gas_price_wei * 0.10)
-            })
-            signed2 = w3.eth.account.sign_transaction(tx2, private_key=acct.key)
-            w3.eth.wait_for_transaction_receipt(w3.eth.send_raw_transaction(signed2.raw_transaction), timeout=30)
-
-        gas_price_wei = w3.eth.gas_price
-        nonce = w3.eth.get_transaction_count(acct.address)
-        est_gas = vault_c.functions.deposit(weth_wei, acct.address).estimate_gas({"from": acct.address})
-        tx3 = vault_c.functions.deposit(weth_wei, acct.address).build_transaction({
-            "chainId": 8453,
-            "from": acct.address,
-            "nonce": nonce,
-            "gas": int(est_gas * 1.20),
-            "maxFeePerGas": int(gas_price_wei * 1.20),
-            "maxPriorityFeePerGas": int(gas_price_wei * 0.10)
-        })
-        signed3 = w3.eth.account.sign_transaction(tx3, private_key=acct.key)
-        txh3 = w3.eth.send_raw_transaction(signed3.raw_transaction)
-        rec3 = w3.eth.wait_for_transaction_receipt(txh3, timeout=35)
-
-        if rec3 and rec3.status == 1:
-            dep_eth = float(Web3.from_wei(weth_wei, "ether"))
-            with state_lock:
-                STATE["mweth_principal_wei"] = int(STATE.get("mweth_principal_wei") or 0) + int(weth_wei)
-            sync_wallet_balances()
-            save_state()
-            msg = f"💎 Deposited {dep_eth:.6f} WETH into Moonwell Flagship ETH Vault!"
-            add_log(msg)
-            return True, msg
-        return False, "Deposit transaction reverted."
-    except Exception as e:
-        return False, f"Deposit error: {e}"
-
-
-def withdraw_from_moonwell_yield():
-    with state_lock:
-        priv = (STATE.get("private_key") or "").strip()
-    if not priv:
-        return False, "Paste your Private Key and click Save first."
-    w3, _, _ = get_web3()
-    try:
-        acct = Account.from_key(priv if priv.startswith("0x") else f"0x{priv}")
-        vault_c = w3.eth.contract(address=Web3.to_checksum_address(MOONWELL_MWETH_VAULT), abi=ERC4626_VAULT_ABI)
-        weth_c = w3.eth.contract(address=Web3.to_checksum_address(BASE_WETH), abi=WETH_ABI)
-        shares_wei = vault_c.functions.balanceOf(acct.address).call()
-        if shares_wei <= 0:
-            return False, "No active Moonwell shares to withdraw."
-
-        gas_price_wei = w3.eth.gas_price
-        nonce = w3.eth.get_transaction_count(acct.address)
-        est_gas = vault_c.functions.redeem(shares_wei, acct.address, acct.address).estimate_gas({"from": acct.address})
-        tx1 = vault_c.functions.redeem(shares_wei, acct.address, acct.address).build_transaction({
-            "chainId": 8453,
-            "from": acct.address,
-            "nonce": nonce,
-            "gas": int(est_gas * 1.20),
-            "maxFeePerGas": int(gas_price_wei * 1.20),
-            "maxPriorityFeePerGas": int(gas_price_wei * 0.10)
-        })
-        signed1 = w3.eth.account.sign_transaction(tx1, private_key=acct.key)
-        w3.eth.wait_for_transaction_receipt(w3.eth.send_raw_transaction(signed1.raw_transaction), timeout=35)
-
-        weth_wei = weth_c.functions.balanceOf(acct.address).call()
-        if weth_wei > 0:
-            nonce = w3.eth.get_transaction_count(acct.address)
-            tx2 = weth_c.functions.withdraw(weth_wei).build_transaction({
-                "chainId": 8453,
-                "from": acct.address,
-                "nonce": nonce,
-                "gas": 60000,
-                "maxFeePerGas": int(gas_price_wei * 1.20),
-                "maxPriorityFeePerGas": int(gas_price_wei * 0.10)
-            })
-            signed2 = w3.eth.account.sign_transaction(tx2, private_key=acct.key)
-            w3.eth.wait_for_transaction_receipt(w3.eth.send_raw_transaction(signed2.raw_transaction), timeout=30)
-
-        sync_wallet_balances()
-        save_state()
-        return True, "✅ Withdrawn 100% ETH + Yield back to your wallet!"
-    except Exception as e:
-        return False, f"Withdraw error: {e}"
-
-
-def resolve_fee_paying_strategies(w3, raw_vaults):
-    multicall = w3.eth.contract(
-        address=Web3.to_checksum_address(MULTICALL3_ADDRESS),
-        abi=MULTICALL3_ABI
-    )
-    calls = [(v["vault"], bytes.fromhex(SEL_VAULT_STRATEGY[2:])) for v in raw_vaults]
-    resolved = []
-    seen = set()
-    try:
-        results = multicall.functions.tryAggregate(False, calls).call()
-        for idx, (success, return_data) in enumerate(results):
-            strat_addr = raw_vaults[idx].get("strategy")
-            if success and return_data and len(return_data) >= 32:
-                extracted = "0x" + return_data[-20:].hex()
-                if int(extracted, 16) != 0:
-                    strat_addr = Web3.to_checksum_address(extracted)
-            if strat_addr and strat_addr not in seen:
-                seen.add(strat_addr)
-                item = dict(raw_vaults[idx])
-                item["strategy"] = strat_addr
-                resolved.append(item)
-
-        hod_calls = [(v["strategy"], bytes.fromhex(SEL_HARVEST_ON_DEPOSIT[2:])) for v in resolved]
-        hod_results = multicall.functions.tryAggregate(False, hod_calls).call()
-        external_caller_strats = []
-        for idx, (ok, rdata) in enumerate(hod_results):
-            is_hod = False
-            if ok and rdata and len(rdata) >= 32:
-                is_hod = bool(int.from_bytes(rdata[:32], byteorder="big") == 1)
-            if not is_hod:
-                external_caller_strats.append(resolved[idx])
-
-        return external_caller_strats if external_caller_strats else resolved[:50]
-    except Exception:
-        return raw_vaults
-
-
-def refresh_long_tail_vaults(chain_key="base", force=False):
-    now_ts = time.time()
-    if (
-        not force
-        and vault_catalog.get(chain_key)
-        and (now_ts - vault_catalog.get("last_fetched", 0)) < 1800
-    ):
-        return vault_catalog[chain_key]
-
-    try:
-        w3, _, _ = get_web3()
-        r = requests.get("https://api.beefy.finance/vaults", timeout=10)
-        if r.status_code == 200:
-            all_vaults = r.json()
-            candidates = []
-            for v in all_vaults:
-                if v.get("chain") == chain_key and v.get("status") == "active" and v.get("earnContractAddress"):
-                    try:
-                        vault_addr = Web3.to_checksum_address(v["earnContractAddress"])
-                        strat_hint = Web3.to_checksum_address(v["strategy"]) if v.get("strategy") else ""
-                    except Exception:
-                        continue
-                    candidates.append({
-                        "id": v.get("id", "vault"),
-                        "name": v.get("name", v.get("id", "Vault")),
-                        "vault": vault_addr,
-                        "strategy": strat_hint,
-                        "platform": v.get("platformId", "DeFi"),
-                        "last_harvest": int(v.get("lastHarvest") or 0)
-                    })
-
-            candidates.sort(key=lambda x: x["last_harvest"] if x["last_harvest"] > 0 else 9999999999)
-            subset = candidates[:130]
-            resolved = resolve_fee_paying_strategies(w3, subset)
-            vault_catalog[chain_key] = resolved
-            vault_catalog["last_fetched"] = now_ts
-            with state_lock:
-                STATE["vaults_monitored"] = len(resolved)
-            add_log(
-                f"📡 Filtered {len(resolved)} external-bounty strategies (harvestOnDeposit == false) on {chain_key.upper()}."
-            )
-    except Exception as e:
-        add_log(f"⚠️ Vault discovery notice: {e}")
-
-    return vault_catalog.get(chain_key, [])
-
-
-def simulate_and_execute_strict_guard(w3, cfg, vault_info, est_bounty_usd, eth_price):
-    with state_lock:
-        live_armed = bool(STATE.get("live_armed", False))
-        priv_key = (STATE.get("private_key") or "").strip()
-        wallet_addr = (STATE.get("wallet_address") or DEFAULT_WALLET_ADDR).strip()
-        guard_addr = (STATE.get("guard_contract") or DEFAULT_GUARD_ADDR).strip()
-        min_profit_usd = float(STATE.get("min_profit_usd") or 0.02)
-
-    if est_bounty_usd < min_profit_usd:
-        return None
-
-    strat_addr = Web3.to_checksum_address(vault_info["strategy"])
-    now_ts = time.time()
-    if now_ts - strategy_cooldowns.get(strat_addr, 0) < 1800:
-        return None
-
-    if not guard_addr or not Web3.is_address(guard_addr) or not wallet_addr:
-        return None
-
-    guard_checksum = Web3.to_checksum_address(guard_addr)
-    caller_addr = Web3.to_checksum_address(wallet_addr)
-
-    try:
-        guard_contract = w3.eth.contract(address=guard_checksum, abi=KEEPER_GUARD_ABI)
-        min_bounty_wei = int(Web3.to_wei(max(min_profit_usd / max(eth_price, 1000.0), 0.000005), "ether"))
-        guard_data = guard_contract.encode_abi("safeHarvest", args=[strat_addr, min_bounty_wei])
-
-        est = w3.eth.estimate_gas({
-            "from": caller_addr,
-            "to": guard_checksum,
-            "data": guard_data,
-            "value": 0
-        })
-        estimated_gas = int(est * 1.18)
-    except Exception:
-        return None
-
-    gas_price_wei = w3.eth.gas_price
-    gas_cost_eth = float(Web3.from_wei(estimated_gas * gas_price_wei, "ether"))
-    gas_cost_usd = gas_cost_eth * eth_price
-    net_profit_usd = est_bounty_usd - gas_cost_usd
-
-    if net_profit_usd < min_profit_usd:
-        return None
-
-    opportunity = {
-        "name": vault_info["name"],
-        "platform": vault_info["platform"],
-        "strategy": strat_addr,
-        "bounty_usd": round(est_bounty_usd, 4),
-        "gas_usd": round(gas_cost_usd, 4),
-        "net_profit_usd": round(net_profit_usd, 4),
-        "estimated_gas": estimated_gas,
-        "time": now_hms()
-    }
-
-    strategy_cooldowns[strat_addr] = now_ts
-
-    if live_armed and priv_key:
-        try:
-            sync_wallet_balances()
-            weth_before = STATE.get("weth_balance", 0.0)
-            aero_before = STATE.get("aero_balance", 0.0)
-            usdc_before = STATE.get("usdc_balance", 0.0)
-
-            acct = Account.from_key(priv_key if priv_key.startswith("0x") else f"0x{priv_key}")
-            nonce = w3.eth.get_transaction_count(acct.address)
-            tx = {
-                "chainId": cfg["chain_id"],
-                "from": acct.address,
-                "to": guard_checksum,
-                "nonce": nonce,
-                "gas": min(estimated_gas, 950000),
-                "maxFeePerGas": int(gas_price_wei * 1.15),
-                "maxPriorityFeePerGas": int(gas_price_wei * 0.10),
-                "value": 0,
-                "data": guard_data
-            }
-            signed_tx = w3.eth.account.sign_transaction(tx, private_key=acct.key)
-            tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
-            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=25)
-            tx_hex = tx_hash.hex()
-
-            sync_wallet_balances()
-            weth_gain_usd = max(0.0, (STATE.get("weth_balance", 0.0) - weth_before) * eth_price)
-            aero_gain_usd = max(0.0, (STATE.get("aero_balance", 0.0) - aero_before) * 1.10)
-            usdc_gain_usd = max(0.0, STATE.get("usdc_balance", 0.0) - usdc_before)
-            actual_gain_usd = weth_gain_usd + aero_gain_usd + usdc_gain_usd
-
-            if receipt and receipt.status == 1 and actual_gain_usd > 0.0001:
-                with state_lock:
-                    STATE["total_bounties_won"] = int(STATE.get("total_bounties_won", 0)) + 1
-                    STATE["realized_profit_usd"] = round(
-                        float(STATE.get("realized_profit_usd", 0.0)) + actual_gain_usd, 4
-                    )
-                    STATE["harvest_ledger"].insert(0, {
-                        "mode": "VERIFIED PAYOUT",
-                        "vault": vault_info["name"],
-                        "strategy": f"{strat_addr[:6]}...{strat_addr[-4:]}",
-                        "bounty_usd": round(actual_gain_usd, 4),
-                        "gas_usd": round(gas_cost_usd, 4),
-                        "net_usd": round(actual_gain_usd - gas_cost_usd, 4),
-                        "tx_url": f"{cfg['explorer']}{tx_hex}",
-                        "time": now_hms()
-                    })
-                add_log(
-                    f"💰 VERIFIED BOUNTY RECEIVED ({vault_info['name']}): "
-                    f"+${actual_gain_usd:.4f} in wallet | Tx: {tx_hex[:10]}..."
+        rebuy_px = price
+    slot["target_rebuy_price"] = round(rebuy_px, px_prec)
+
+    now = time.time()
+    paper_tokens = float(slot.get("paper_base_bal", 0.0))
+    pos_val = paper_tokens * price
+
+    if paper_tokens <= 0 or pos_val < (principal * 0.50):
+        if pullback_pct > 0 and last_sell_px > 0:
+            breakout_px = last_sell_px * 1.005
+            waited_sec = now - float(slot.get("last_trade_ts", 0.0))
+            if rebuy_px < price < breakout_px and waited_sec < 180:
+                slot["phase"] = "WAITING_TO_BUY"
+                slot["base_balance"] = 0.0
+                slot["position_value_usdt"] = 0.0
+                slot["status_msg"] = (
+                    f"[STUDY] Holding USDT — Waiting for -{pullback_pct}% dip ({fmt_px(rebuy_px)}) "
+                    f"or +0.5% breakout ({fmt_px(breakout_px)}) | {int(180 - waited_sec)}s left"
                 )
-                save_state()
-        except Exception as e:
-            add_log(f"🛡️ KeeperGuard blocked {vault_info['name']}: {e}")
+                return
 
-    return opportunity
-
-
-def run_unified_dual_core_cycle(manual=False):
-    global _scan_counter
-    if not scan_lock.acquire(blocking=False):
+        sim_tokens = principal / price
+        slot["paper_base_bal"] = sim_tokens
+        slot["base_balance"] = sim_tokens
+        slot["position_value_usdt"] = round(principal, 4)
+        slot["entry_price"] = price
+        target_px = price * (1.0 + (effective_gain_pct / 100.0))
+        stop_px = price * (1.0 - (stop_reset_pct / 100.0))
+        slot["target_sell_price"] = round(target_px, px_prec)
+        slot["stop_reset_price"] = round(stop_px, px_prec)
+        slot["phase"] = "HOLDING_FOR_SKIM"
+        slot["status_msg"] = f"[STUDY] Sim Bought ${principal:.2f} @ {fmt_px(price)} → Target {fmt_px(target_px)}"
         return
-    t0 = time.time()
-    try:
-        eth_price = update_market_prices()
-        run_spot_volatility_skimmer_step()
-        sync_wallet_balances()
-        w3, chain_key, cfg = get_web3()
 
-        # Scan Moonwell borrowers for Flash-Loan Micro-Liquidations on Base
-        underwater_list = []
-        if chain_key == "base":
-            underwater_list = discover_and_scan_moonwell_borrowers(w3)
+    slot["phase"] = "HOLDING_FOR_SKIM"
+    slot["base_balance"] = paper_tokens
+    slot["position_value_usdt"] = round(pos_val, 4)
+    entry_px = slot["entry_price"] if slot["entry_price"] > 0 else price
+    target_px = entry_px * (1.0 + (effective_gain_pct / 100.0))
+    stop_px = entry_px * (1.0 - (stop_reset_pct / 100.0))
+    slot["target_sell_price"] = round(target_px, px_prec)
+    slot["stop_reset_price"] = round(stop_px, px_prec)
+    slot["unrealized_pnl_usdt"] = round(pos_val - principal, 4)
+    slot["unrealized_pnl_pct"] = round(((price - entry_px) / entry_px) * 100.0, 3)
 
-        vaults = refresh_long_tail_vaults(chain_key)
-        if not vaults:
+    if 0 < stop_reset_pct < 90 and price <= stop_px:
+        slot["paper_base_bal"] = principal / price
+        slot["entry_price"] = price
+        slot["last_trade_ts"] = now
+        slot["status_msg"] = f"[STUDY -{stop_reset_pct}% RESET] Rebought floor @ {fmt_px(price)}"
+        return
+
+    if price >= target_px:
+        pct_gain = (price - entry_px) / entry_px
+        sim_profit = max(0.01, round(principal * pct_gain - principal * (fee_buf / 100.0), 4))
+        slot["slot_skimmed_usdt"] = round(slot.get("slot_skimmed_usdt", 0.0) + sim_profit, 4)
+        slot["slot_skim_count"] = slot.get("slot_skim_count", 0) + 1
+        STATE["paper_skimmed_usdt"] = round(STATE.get("paper_skimmed_usdt", 0.0) + sim_profit, 4)
+        STATE["paper_skim_count"] = STATE.get("paper_skim_count", 0) + 1
+        old_entry = entry_px
+        slot["last_skim_sell_price"] = price
+        slot["last_trade_ts"] = now
+
+        STATE["paper_ledger"].insert(0, {
+            "time": datetime.utcnow().strftime("%H:%M:%S"),
+            "pair": f"{pair} (PAPER)",
+            "cycle": f"#{STATE['paper_skim_count']}",
+            "buy_px": f"{fmt_px(old_entry)} (${principal:.2f})",
+            "sell_px": f"{fmt_px(price)} (${principal + sim_profit:.2f})",
+            "profit": f"+${sim_profit:.4f}",
+            "principal_redeployed": f"${principal:.2f}"
+        })
+        STATE["paper_ledger"] = STATE["paper_ledger"][:50]
+
+        add_log(f"🧪 [PAPER STUDY SKIM][{pair}] Hit +{skim_pct}%! Sim Profit: +${sim_profit:.4f} (Total Flips: {slot['slot_skim_count']})")
+
+        if pullback_pct > 0:
+            slot["paper_base_bal"] = 0.0
+            slot["base_balance"] = 0.0
+            slot["phase"] = "WAITING_TO_BUY"
+            slot["status_msg"] = (
+                f"[STUDY] Skimmed +${sim_profit:.4f}! Waiting for -{pullback_pct}% dip "
+                f"({fmt_px(rebuy_px)}) or +0.5% breakout (180s)"
+            )
+        else:
+            slot["paper_base_bal"] = principal / price
+            slot["entry_price"] = price
+            slot["status_msg"] = f"[STUDY] Skimmed +${sim_profit:.4f} & Instant Rebought @ {fmt_px(price)}"
+    else:
+        slot["status_msg"] = f"[STUDY] {slot['unrealized_pnl_pct']:+.2f}% | Target {fmt_px(target_px)} | 24h Range: {slot['range_24h_pct']}%"
+
+
+# =========================================================================
+# ENGINE 2: LIVE GATE.IO CASH SLOT PROCESSOR (With Strict Fill Verification!)
+# =========================================================================
+def process_live_slot(pair, slot, fee_buf, has_keys, bal_map, ticker_map):
+    base_curr = pair.split("_")[0]
+    principal = float(slot["principal_usdt"])
+    skim_pct = float(slot["skim_target_pct"])
+    stop_reset_pct = float(slot.get("stop_reset_pct", 99.0))
+    pullback_pct = float(slot.get("rebuy_pullback_pct", 0.30))
+
+    tk = ticker_map.get(pair)
+    if not tk:
+        raise ValueError(f"Pair {pair} not found on Gate.io")
+
+    meta = get_pair_meta(pair)
+    price = tk["last"]
+    amt_prec = meta["amount_prec"]
+    px_prec = meta["price_prec"]
+    min_quote = meta["min_quote"]
+
+    slot["last_price"] = price
+    slot["price_prec"] = px_prec
+    slot["high_24h"] = tk["high_24h"]
+    slot["low_24h"] = tk["low_24h"]
+    slot["change_24h_pct"] = tk["change_24h"]
+    slot["range_24h_pct"] = tk.get("range_24h_pct", 0.0)
+
+    effective_gain_pct = skim_pct + fee_buf
+    last_sell_px = float(slot.get("last_skim_sell_price", 0.0))
+    if last_sell_px > 0 and pullback_pct > 0:
+        rebuy_px = last_sell_px * (1.0 - (pullback_pct / 100.0))
+    else:
+        rebuy_px = price
+    slot["target_rebuy_price"] = round(rebuy_px, px_prec)
+
+    if slot["entry_price"] > price * 1.5 or slot["entry_price"] < price * 0.5:
+        slot["entry_price"] = 0.0
+
+    now = time.time()
+    in_cooldown = (now - float(slot.get("last_trade_ts", 0.0))) < 12.0
+
+    if not has_keys:
+        slot["status_msg"] = "[LIVE] Connect Gate.io API Keys above first"
+        return
+
+    real_base_bal = bal_map.get(base_curr, 0.0)
+    real_usdt_bal = bal_map.get("USDT", 0.0)
+    slot["base_balance"] = real_base_bal
+
+    sellable_amt_str = format_dec(real_base_bal, amt_prec, ROUND_DOWN)
+    sellable_units = float(sellable_amt_str)
+    sellable_val_usdt = sellable_units * price
+    pos_val = real_base_bal * price
+    slot["position_value_usdt"] = round(pos_val, 4)
+
+    holding_tokens = sellable_val_usdt >= max(min_quote * 1.05, principal * 0.65)
+    if holding_tokens:
+        slot["phase"] = "HOLDING_FOR_SKIM"
+        if slot["entry_price"] <= 0:
+            slot["entry_price"] = price
+        if slot.get("actual_cost_usdt", 0.0) <= 0:
+            slot["actual_cost_usdt"] = round(sellable_units * slot["entry_price"], 4)
+    else:
+        if not in_cooldown:
+            slot["phase"] = "WAITING_TO_BUY"
+
+    entry_px = slot["entry_price"] if slot["entry_price"] > 0 else price
+    actual_cost = float(slot.get("actual_cost_usdt") or (sellable_units * entry_px))
+
+    required_net_usdt = actual_cost * (1.0 + (effective_gain_pct / 100.0))
+    if sellable_units > 0:
+        min_profitable_px = required_net_usdt / sellable_units
+        target_sell_px = max(entry_px * (1.0 + (effective_gain_pct / 100.0)), min_profitable_px)
+    else:
+        target_sell_px = entry_px * (1.0 + (effective_gain_pct / 100.0))
+
+    stop_reset_px = entry_px * (1.0 - (stop_reset_pct / 100.0))
+    slot["target_sell_price"] = round(target_sell_px, px_prec)
+    slot["stop_reset_price"] = round(stop_reset_px, px_prec)
+
+    if holding_tokens and entry_px > 0:
+        slot["unrealized_pnl_usdt"] = round(sellable_val_usdt - actual_cost, 4)
+        slot["unrealized_pnl_pct"] = round(((price - entry_px) / entry_px) * 100.0, 3)
+    else:
+        slot["unrealized_pnl_usdt"] = 0.0
+        slot["unrealized_pnl_pct"] = 0.0
+
+    if in_cooldown:
+        slot["status_msg"] = f"[LIVE] Order Settled — Cooldown Active | Entry {fmt_px(entry_px)}"
+        return
+
+    if slot["phase"] == "HOLDING_FOR_SKIM":
+        if 0 < stop_reset_pct < 90 and price <= stop_reset_px:
+            sell_px_str = format_dec(price * 0.995, px_prec)
+            code, resp = place_gate_order(pair, "sell", sellable_amt_str, sell_px_str)
+            filled_sell = float(resp.get("filled_total") or 0.0) if isinstance(resp, dict) else 0.0
+            if code in (200, 201) and filled_sell > (actual_cost * 0.50):
+                old_ep = entry_px
+                slot["last_trade_ts"] = time.time()
+                time.sleep(0.45)
+                rebuy_budget = min(principal, max(filled_sell * 0.996, min_quote * 1.05))
+                rebuy_amt_str = calc_fee_protected_buy_amt(rebuy_budget, price, amt_prec)
+                rebuy_px_str = format_dec(price * 1.004, px_prec)
+                b_code, b_resp = place_gate_order(pair, "buy", rebuy_amt_str, rebuy_px_str)
+                filled_usdt = float(b_resp.get("filled_total") or 0.0) if isinstance(b_resp, dict) else 0.0
+                if filled_usdt > 0:
+                    slot["entry_price"] = price
+                    slot["actual_cost_usdt"] = round(filled_usdt, 4)
+                    new_target = price * (1.0 + (effective_gain_pct / 100.0))
+                    slot["target_sell_price"] = round(new_target, px_prec)
+                    slot["stop_reset_price"] = round(price * (1.0 - (stop_reset_pct / 100.0)), px_prec)
+                    slot["status_msg"] = f"[LIVE -{stop_reset_pct}% RESET] Rebought @ {fmt_px(price)} → Target {fmt_px(new_target)}"
+                    add_log(
+                        f"🔄 [LIVE -{stop_reset_pct}% RESET][{pair}] Dropped {fmt_px(old_ep)} → {fmt_px(price)}. "
+                        f"Sold & Rebought @ {fmt_px(price)}"
+                    )
             return
 
-        multicall = w3.eth.contract(
-            address=Web3.to_checksum_address(MULTICALL3_ADDRESS),
-            abi=MULTICALL3_ABI
-        )
+        if price < target_sell_px or sellable_val_usdt < required_net_usdt:
+            slot["status_msg"] = (
+                f"[LIVE] {slot['unrealized_pnl_pct']:+.2f}% (Sellable: ${sellable_val_usdt:.2f} / "
+                f"Target: ${required_net_usdt:.2f} @ {fmt_px(target_sell_px)})"
+            )
+            return
 
-        calls = []
-        for v in vaults:
-            calls.append((v["strategy"], bytes.fromhex(SEL_CALL_REWARD[2:])))
-            calls.append((v["strategy"], bytes.fromhex(SEL_REWARDS_AVAIL[2:])))
+        # Use 0.996 IOC limit buffer so micro-cap tokens like PEPE fill 100% of the time!
+        sell_px_str = format_dec(price * 0.996, px_prec)
+        code, resp = place_gate_order(pair, "sell", sellable_amt_str, sell_px_str)
 
-        results = multicall.functions.tryAggregate(False, calls).call()
+        if code in (200, 201):
+            # CRITICAL FIX: Verify that Gate.io actually filled the sell order (never log $0.00 fills!)
+            gross_usdt_received = float(resp.get("filled_total") or 0.0)
+            left_unfilled = float(resp.get("left") or 0.0)
+            if gross_usdt_received < (actual_cost * 0.50):
+                add_log(
+                    f"⚠️ [LIVE][{pair}] IOC Sell did not fill on orderbook (Filled: ${gross_usdt_received:.2f}, Left: {left_unfilled}). "
+                    f"Keeping Entry Floor {fmt_px(entry_px)} locked & retrying next scan!"
+                )
+                return
 
-        verified_opps = []
-        for uw in underwater_list:
-            verified_opps.append({
-                "name": f"Moonwell Flash-Liquidate {uw['borrower'][:6]}...{uw['borrower'][-4:]}",
-                "platform": "Morpho 0% Flash",
-                "strategy": uw["borrower"],
-                "bounty_usd": uw["est_bonus_usd"],
-                "gas_usd": 0.005,
-                "net_profit_usd": round(uw["est_bonus_usd"] - 0.005, 4),
-                "time": now_hms()
+            slot["last_trade_ts"] = time.time()
+            fee_deducted = float(resp.get("fee") or (gross_usdt_received * 0.001))
+            net_usdt_received = gross_usdt_received - fee_deducted
+
+            true_cash_profit = round(net_usdt_received - actual_cost, 4)
+            if true_cash_profit <= 0:
+                true_cash_profit = round(gross_usdt_received - actual_cost, 4)
+            true_cash_profit = max(0.01, true_cash_profit)
+
+            slot["slot_skimmed_usdt"] = round(slot.get("slot_skimmed_usdt", 0.0) + true_cash_profit, 4)
+            slot["slot_skim_count"] = slot.get("slot_skim_count", 0) + 1
+            STATE["live_skimmed_usdt"] = round(STATE.get("live_skimmed_usdt", 0.0) + true_cash_profit, 4)
+            STATE["live_skim_count"] = STATE.get("live_skim_count", 0) + 1
+            old_entry = entry_px
+            slot["last_skim_sell_price"] = price
+
+            STATE["skim_ledger"].insert(0, {
+                "time": datetime.utcnow().strftime("%H:%M:%S"),
+                "pair": f"{pair} (LIVE)",
+                "cycle": f"#{STATE['live_skim_count']}",
+                "buy_px": f"{fmt_px(old_entry)} (${actual_cost:.2f})",
+                "sell_px": f"{fmt_px(price)} (${net_usdt_received:.2f})",
+                "profit": f"+${true_cash_profit:.4f}",
+                "principal_redeployed": f"${actual_cost:.2f}"
             })
+            STATE["skim_ledger"] = STATE["skim_ledger"][:50]
 
-        highest_seen_usd = 0.0
-        highest_vault_name = "None"
-        min_prof = float(STATE.get("min_profit_usd") or 0.02)
+            add_log(
+                f"💎 [LIVE SKIM][{pair}] Sold {sellable_amt_str} {base_curr} for ${net_usdt_received:.2f} USDT "
+                f"(Cost: ${actual_cost:.2f}) | Real Cash Added: +${true_cash_profit:.4f} USDT!"
+            )
 
-        for idx, v in enumerate(vaults):
-            res_cr = results[idx * 2]
-            res_ra = results[idx * 2 + 1]
+            if pullback_pct <= 0.0:
+                time.sleep(0.45)
+                rebuy_budget = min(principal, net_usdt_received - true_cash_profit)
+                rebuy_amt_str = calc_fee_protected_buy_amt(rebuy_budget, price, amt_prec)
+                rebuy_px_str = format_dec(price * 1.004, px_prec)
+                b_code, b_resp = place_gate_order(pair, "buy", rebuy_amt_str, rebuy_px_str)
+                spent_usdt = float(b_resp.get("filled_total") or 0.0) if isinstance(b_resp, dict) else 0.0
+                if b_code in (200, 201) and spent_usdt > (principal * 0.50):
+                    slot["entry_price"] = price
+                    slot["actual_cost_usdt"] = round(spent_usdt, 4)
+                    slot["phase"] = "HOLDING_FOR_SKIM"
+                    new_target = price * (1.0 + (effective_gain_pct / 100.0))
+                    slot["target_sell_price"] = round(new_target, px_prec)
+                    slot["status_msg"] = f"[LIVE] Cash Skimmed +${true_cash_profit:.4f} & Rebought (${spent_usdt:.2f}) @ {fmt_px(price)}"
+                else:
+                    slot["phase"] = "WAITING_TO_BUY"
+                    slot["entry_price"] = 0.0
+                    slot["actual_cost_usdt"] = 0.0
+            else:
+                slot["phase"] = "WAITING_TO_BUY"
+                slot["entry_price"] = 0.0
+                slot["actual_cost_usdt"] = 0.0
+                slot["status_msg"] = (
+                    f"[LIVE] Cash Protected in USDT (+${true_cash_profit:.4f})! "
+                    f"Waiting for -{pullback_pct}% dip ({fmt_px(rebuy_px)}) or +0.5% breakout (180s)"
+                )
+        else:
+            add_log(f"[LIVE][{pair}] Sell rejected ({code}): {resp.get('message', resp)}")
+        return
 
-            raw_wei = 0
-            if res_cr[0] and res_cr[1] and len(res_cr[1]) >= 32:
-                raw_wei = int.from_bytes(res_cr[1][:32], byteorder="big")
-            if raw_wei == 0 and res_ra[0] and res_ra[1] and len(res_ra[1]) >= 32:
-                avail_wei = int.from_bytes(res_ra[1][:32], byteorder="big")
-                raw_wei = int(avail_wei * 0.0025)
+    # =========================================================================
+    # SMART 3-WAY REBUY: Dip (-0.30%) OR Breakout (+0.50%) OR 180s Timeout
+    # =========================================================================
+    if slot["phase"] == "WAITING_TO_BUY":
+        if pullback_pct > 0 and last_sell_px > 0:
+            breakout_px = last_sell_px * 1.005
+            waited_sec = now - float(slot.get("last_trade_ts", 0.0))
+            if rebuy_px < price < breakout_px and waited_sec < 180:
+                slot["status_msg"] = (
+                    f"[LIVE] Holding USDT — Waiting for -{pullback_pct}% dip ({fmt_px(rebuy_px)}) "
+                    f"or +0.5% breakout ({fmt_px(breakout_px)}) | {int(180 - waited_sec)}s left"
+                )
+                return
 
-            bounty_eth = float(Web3.from_wei(raw_wei, "ether")) if raw_wei > 0 else 0.0
-            bounty_usd = bounty_eth * 1.10 if bounty_eth > 0.15 else bounty_eth * eth_price
+        if real_usdt_bal < (principal * 0.95):
+            slot["status_msg"] = f"[LIVE] Awaiting USDT (Wallet: ${real_usdt_bal:.2f} / Need: ${principal:.2f})"
+            return
 
-            if 0.0005 < bounty_usd < 25.0:
-                if bounty_usd > highest_seen_usd:
-                    highest_seen_usd = bounty_usd
-                    highest_vault_name = v["name"]
+        buy_budget = min(principal, real_usdt_bal * 0.995)
+        buy_amt_str = calc_fee_protected_buy_amt(buy_budget, price, amt_prec)
+        buy_px_str = format_dec(price * 1.004, px_prec)
+        code, resp = place_gate_order(pair, "buy", buy_amt_str, buy_px_str)
 
-            if bounty_usd >= min_prof:
-                opp = simulate_and_execute_strict_guard(w3, cfg, v, bounty_usd, eth_price)
-                if opp:
-                    verified_opps.append(opp)
+        if code in (200, 201):
+            spent_usdt = float(resp.get("filled_total") or 0.0)
+            if spent_usdt < (principal * 0.50):
+                add_log(f"⚠️ [LIVE][{pair}] IOC Buy did not fill on orderbook. Retrying next scan.")
+                return
+            slot["last_trade_ts"] = time.time()
+            slot["entry_price"] = price
+            slot["actual_cost_usdt"] = round(spent_usdt, 4)
+            slot["phase"] = "HOLDING_FOR_SKIM"
+            new_target = price * (1.0 + (effective_gain_pct / 100.0))
+            slot["target_sell_price"] = round(new_target, px_prec)
+            slot["stop_reset_price"] = round(price * (1.0 - (stop_reset_pct / 100.0)), px_prec)
+            slot["status_msg"] = f"[LIVE] Bought {buy_amt_str} {base_curr} (${spent_usdt:.2f}) @ {fmt_px(price)}"
+            bal_map["USDT"] = max(0.0, real_usdt_bal - spent_usdt)
+            add_log(f"[LIVE BUY][{pair}] Bought {buy_amt_str} {base_curr} (Actual Cost: ${spent_usdt:.2f}) @ {fmt_px(price)}")
+        else:
+            add_log(f"[LIVE][{pair}] Buy rejected ({code}): {resp.get('message', resp)}")
 
-        elapsed_ms = int((time.time() - t0) * 1000)
-        _scan_counter += 1
+
+def run_fleet_cycle(force_manual=False):
+    if not cycle_lock.acquire(blocking=force_manual):
+        return
+
+    t0 = time.time()
+    try:
+        with state_lock:
+            fee_buf = float(STATE.get("fee_buffer_pct", 0.25))
+            has_keys = bool(STATE.get("api_key") and STATE.get("api_secret"))
+            live_keys = list(STATE["slots"].keys())
+            paper_keys = list(STATE.get("paper_slots", {}).keys())
+            all_pairs = list(set(live_keys + paper_keys))
+
+        bal_map = {}
+        if has_keys:
+            try:
+                bal_map = fetch_all_spot_balances()
+                with state_lock:
+                    STATE["api_connected"] = True
+                    STATE["usdt_balance"] = bal_map.get("USDT", 0.0)
+                    STATE["api_status_msg"] = f"Connected to Gate.io v4 (Available: ${STATE['usdt_balance']:.2f} USDT)"
+            except Exception as e:
+                with state_lock:
+                    STATE["api_connected"] = False
+                    STATE["api_status_msg"] = f"Auth Notice: {str(e)[:55]}"
+
+        if not all_pairs:
+            with state_lock:
+                STATE["cycle_count"] = STATE.get("cycle_count", 0) + 1
+                STATE["last_worker_heartbeat"] = time.time()
+                STATE["last_scan_ms"] = int((time.time() - t0) * 1000)
+                STATE["last_update"] = datetime.utcnow().strftime("%H:%M:%S")
+            return
+
+        ticker_map = {}
+        try:
+            ticker_map = fetch_batch_tickers(all_pairs)
+        except Exception as tk_err:
+            add_log(f"Ticker batch notice: {str(tk_err)[:60]}")
+            return
+
+        for pair in live_keys:
+            with state_lock:
+                slot = STATE["slots"].get(pair)
+                if not slot:
+                    continue
+            try:
+                process_live_slot(pair, slot, fee_buf, has_keys, bal_map, ticker_map)
+            except Exception as slot_err:
+                with state_lock:
+                    slot["status_msg"] = f"Notice: {str(slot_err)[:55]}"
+
+        paper_allocated = 0.0
+        for pair in paper_keys:
+            with state_lock:
+                pslot = STATE["paper_slots"].get(pair)
+                if not pslot:
+                    continue
+                paper_allocated += float(pslot.get("principal_usdt", 0.0))
+            try:
+                process_paper_slot(pair, pslot, fee_buf, ticker_map)
+            except Exception as p_err:
+                with state_lock:
+                    pslot["status_msg"] = f"Notice: {str(p_err)[:55]}"
 
         with state_lock:
-            STATE["last_scan_hms"] = now_hms()
-            STATE["last_scan_ms"] = elapsed_ms
-            STATE["vaults_monitored"] = len(vaults)
-            STATE["live_opportunities"] = sorted(
-                verified_opps, key=lambda x: x["net_profit_usd"], reverse=True
-            )[:15]
-            if len(STATE["harvest_ledger"]) > 50:
-                STATE["harvest_ledger"] = STATE["harvest_ledger"][:50]
-            mw_assets = STATE.get("mweth_assets_eth", 0.0)
-            mw_wei_gain = STATE.get("mweth_earned_wei", 0)
-            pnl_usd = STATE.get("position_pnl_usd", 0.0)
-            b_tracked = STATE.get("borrowers_tracked", 0)
+            STATE["paper_bankroll_usdt"] = 100.0
+            STATE["paper_free_usdt"] = round(max(0.0, 100.0 - paper_allocated) + float(STATE.get("paper_skimmed_usdt", 0.0)), 4)
+            STATE["cycle_count"] = STATE.get("cycle_count", 0) + 1
+            STATE["last_worker_heartbeat"] = time.time()
+            STATE["last_scan_ms"] = int((time.time() - t0) * 1000)
+            STATE["last_update"] = datetime.utcnow().strftime("%H:%M:%S")
+            save_state()
 
-        if manual or _scan_counter <= 2 or (_scan_counter % 4 == 0):
-            add_log(
-                f"🔍 Cycle #{_scan_counter} ({elapsed_ms}ms): Moonwell: {mw_assets:.8f} ETH (+{mw_wei_gain:,} Wei | +${pnl_usd:.4f}) "
-                f"| Flash Borrowers Checked: {b_tracked} | Top Bounty: ${highest_seen_usd:.4f} ({highest_vault_name})"
-            )
-        save_state()
-    except Exception as e:
-        add_log(f"⚠️ Cycle notice: {e}")
     finally:
-        scan_lock.release()
+        cycle_lock.release()
 
 
-def background_keeper_loop():
+def background_worker():
+    load_state()
+    add_log("VaultSkimmer v5.8.2 Online (Verified Order Fill Guard + 180s Smart Rebuy + $100 Paper Lab).")
     while True:
-        run_unified_dual_core_cycle(manual=False)
-        time.sleep(12.0)
+        run_fleet_cycle(force_manual=False)
+        time.sleep(3.5)
 
 
-_worker_started = False
+def ensure_worker_alive():
+    global worker_started
+    now = time.time()
+    if not worker_started or (now - STATE.get("last_worker_heartbeat", 0) > 12):
+        worker_started = True
+        STATE["last_worker_heartbeat"] = now
+        threading.Thread(target=background_worker, daemon=True).start()
 
 
 @app.before_request
-def start_background_scanner():
-    global _worker_started
-    if not _worker_started:
-        _worker_started = True
-        threading.Thread(target=background_keeper_loop, daemon=True).start()
+def check_worker():
+    ensure_worker_alive()
 
 
-threading.Thread(target=background_keeper_loop, daemon=True).start()
-_worker_started = True
+@app.route("/icon.svg")
+def app_icon():
+    svg = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+      <defs>
+        <linearGradient id="g" x1="0%" y1="0%" x2="100%" y2="100%">
+          <stop offset="0%" stop-color="#10b981"/>
+          <stop offset="100%" stop-color="#06b6d4"/>
+        </linearGradient>
+      </defs>
+      <rect width="512" height="512" rx="115" fill="#060b16"/>
+      <rect x="28" y="28" width="456" height="456" rx="95" fill="none" stroke="url(#g)" stroke-width="18"/>
+      <path d="M135 165 L256 385 L377 165" fill="none" stroke="url(#g)" stroke-width="48" stroke-linecap="round" stroke-linejoin="round"/>
+      <circle cx="256" cy="145" r="28" fill="#34d399"/>
+    </svg>"""
+    return Response(svg, mimetype="image/svg+xml")
 
 
-# ==============================================================================
-# 6. UNIFIED COMMAND CENTER UI (FLASH LOANS + MOONWELL YIELD + SPOT SKIMMER)
-# ==============================================================================
-KEEPER_UI_HTML = """<!DOCTYPE html>
+@app.route("/manifest.json")
+def manifest():
+    return jsonify({
+        "name": "VaultSkimmer v5.8.2 Dual-Engine",
+        "short_name": "VaultSkimmer",
+        "description": "True-Cash Spot Skimmer, 180s Smart Rebuy & $100 Paper Lab",
+        "start_url": "/",
+        "display": "standalone",
+        "background_color": "#060b16",
+        "theme_color": "#10b981",
+        "icons": [{"src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable"}]
+    })
+
+
+@app.route("/sw.js")
+def service_worker():
+    js = """
+    self.addEventListener('install', e => self.skipWaiting());
+    self.addEventListener('activate', e => e.waitUntil(self.clients.claim()));
+    self.addEventListener('fetch', e => {
+      e.respondWith(fetch(e.request).catch(() => caches.match(e.request)));
+    });
+    """
+    return Response(js, mimetype="application/javascript")
+
+
+@app.route("/ping")
+def ping():
+    return jsonify({"ok": True, "service": "VaultSkimmer-v5.8.2-Dual", "cycle": STATE["cycle_count"]})
+
+
+@app.route("/api/cron")
+def api_cron():
+    run_fleet_cycle(force_manual=False)
+    return jsonify({
+        "ok": True,
+        "live_tokens": list(STATE["slots"].keys()),
+        "paper_tokens": list(STATE.get("paper_slots", {}).keys()),
+        "live_skimmed_usdt": STATE.get("live_skimmed_usdt", 0.0),
+        "paper_skimmed_usdt": STATE.get("paper_skimmed_usdt", 0.0),
+        "cycle": STATE["cycle_count"]
+    })
+
+
+@app.route("/api/scan_now", methods=["POST"])
+def api_scan_now():
+    run_fleet_cycle(force_manual=True)
+    return jsonify({"ok": True, "scan_ms": STATE["last_scan_ms"]})
+
+
+@app.route("/api/state")
+def api_state():
+    if STATE["cycle_count"] == 0:
+        run_fleet_cycle(force_manual=False)
+    with state_lock:
+        safe = STATE.copy()
+        safe["has_saved_keys"] = bool(STATE.get("api_key") and STATE.get("api_secret"))
+        safe["api_key"] = ""
+        safe["api_secret"] = ""
+        return jsonify(safe)
+
+
+@app.route("/api/sync_keys", methods=["POST"])
+def api_sync_keys():
+    data = request.json or {}
+    raw_key = (data.get("api_key") or "").strip().replace(" ", "").replace("\n", "").replace("\r", "")
+    raw_sec = (data.get("api_secret") or "").strip().replace(" ", "").replace("\n", "").replace("\r", "")
+
+    with state_lock:
+        if raw_key and "Saved" not in raw_key:
+            STATE["api_key"] = raw_key
+        if raw_sec and "Saved" not in raw_sec:
+            STATE["api_secret"] = raw_sec
+        active_key = STATE.get("api_key", "").strip()
+        active_secret = STATE.get("api_secret", "").strip()
+
+    if not active_key or not active_secret:
+        with state_lock:
+            STATE["api_connected"] = False
+            STATE["api_status_msg"] = "No API Keys Saved Yet — Paste Key & Secret Above"
+            save_state()
+        return jsonify({"ok": False, "error": "No saved keys found. Please paste both your Gate.io API Key and Secret."}), 400
+
+    try:
+        bal_map = fetch_all_spot_balances(active_key, active_secret)
+        usdt_avail = bal_map.get("USDT", 0.0)
+        non_zero = [f"{k}: {v:.4f}" for k, v in bal_map.items() if v > 0][:6]
+        summary = ", ".join(non_zero) if non_zero else "0.00 USDT"
+        with state_lock:
+            STATE["api_connected"] = True
+            STATE["usdt_balance"] = usdt_avail
+            STATE["api_status_msg"] = f"Verified & Connected! Gate.io USDT: ${usdt_avail:.2f}"
+            add_log(f"🔗 Gate.io API Keys Verified! Live Wallet: {summary}")
+            save_state()
+        return jsonify({"ok": True, "usdt_balance": usdt_avail, "status_msg": STATE["api_status_msg"]})
+    except Exception as e:
+        err_str = str(e)[:80]
+        with state_lock:
+            STATE["api_connected"] = False
+            STATE["api_status_msg"] = f"Connection Error: {err_str}"
+            add_log(f"❌ Gate.io API Sync Error: {err_str}")
+            save_state()
+        return jsonify({"ok": False, "error": err_str}), 400
+
+
+@app.route("/api/reset_live_vault", methods=["POST"])
+def api_reset_live_vault():
+    with state_lock:
+        STATE["live_skimmed_usdt"] = 0.0
+        STATE["live_skim_count"] = 0
+        STATE["skim_ledger"] = []
+        for sl in STATE["slots"].values():
+            sl["slot_skimmed_usdt"] = 0.0
+            sl["slot_skim_count"] = 0
+        add_log("🔄 Live Profit Vault & Live Ledger reset to $0.0000!")
+        save_state()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/reset_paper_vault", methods=["POST"])
+def api_reset_paper_vault():
+    with state_lock:
+        STATE["paper_skimmed_usdt"] = 0.0
+        STATE["paper_skim_count"] = 0
+        STATE["paper_ledger"] = []
+        for sl in STATE.get("paper_slots", {}).values():
+            sl["slot_skimmed_usdt"] = 0.0
+            sl["slot_skim_count"] = 0
+        add_log("🧪 Paper Study Profit Vault reset to $0.0000 (Base Account remains $100.00)!")
+        save_state()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/enable_pullback_shield", methods=["POST"])
+def api_enable_pullback_shield():
+    with state_lock:
+        for sl in STATE["slots"].values():
+            sl["rebuy_pullback_pct"] = 0.30
+        for sl in STATE.get("paper_slots", {}).values():
+            sl["rebuy_pullback_pct"] = 0.30
+        add_log("🛡️ Activated Smart Rebuy Shield across all Live & Paper slots (-0.30% Dip OR +0.50% Breakout OR 180s Timeout).")
+        save_state()
+    run_fleet_cycle(force_manual=True)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/add_or_update_slot", methods=["POST"])
+def api_add_or_update_slot():
+    data = request.json or {}
+    target_engine = (data.get("target_engine") or "PAPER").upper()
+    pair = normalize_pair(data.get("pair", ""))
+    if not pair:
+        return jsonify({"ok": False, "error": "Please enter a Token Symbol first."}), 400
+
+    raw_prin = str(data.get("principal_usdt") or "").strip()
+    if not raw_prin or float(raw_prin) <= 0:
+        return jsonify({"ok": False, "error": "Please enter a valid Slot Protected Principal (USDT)."}), 400
+
+    raw_skim = str(data.get("skim_target_pct") or "").strip()
+    if not raw_skim or float(raw_skim) <= 0:
+        return jsonify({"ok": False, "error": "Please enter a Skim Profit Target % (e.g. 1.0 or 0.65)."}), 400
+
+    principal = max(1.0, float(raw_prin))
+    skim_pct = max(0.1, float(raw_skim))
+
+    raw_stop = str(data.get("stop_reset_pct") or "").strip()
+    stop_reset_pct = max(0.5, float(raw_stop)) if raw_stop else 99.0
+
+    raw_pb = str(data.get("rebuy_pullback_pct") or "").strip()
+    pullback_pct = max(0.0, float(raw_pb)) if raw_pb != "" else 0.30
+
+    raw_ep = str(data.get("entry_price") or "").strip()
+    custom_ep = float(raw_ep) if (raw_ep and float(raw_ep) > 0) else 0.0
+
+    with state_lock:
+        if target_engine == "LIVE":
+            existing = STATE["slots"].get(pair)
+            if existing:
+                existing["principal_usdt"] = principal
+                existing["skim_target_pct"] = skim_pct
+                existing["stop_reset_pct"] = stop_reset_pct
+                existing["rebuy_pullback_pct"] = pullback_pct
+                if custom_ep > 0:
+                    existing["entry_price"] = custom_ep
+                add_log(f"Updated LIVE Slot: {pair} (${principal:.2f} | +{skim_pct}% Skim | -{pullback_pct}% Smart Rebuy)")
+            else:
+                STATE["slots"][pair] = make_slot(pair, principal, skim_pct, stop_reset_pct, pullback_pct, custom_ep, "LIVE")
+                add_log(f"Commanded LIVE Slot: {pair} (${principal:.2f} Base | +{skim_pct}% Skim | -{pullback_pct}% Smart Rebuy)")
+        else:
+            if "paper_slots" not in STATE:
+                STATE["paper_slots"] = {}
+            existing_p = STATE["paper_slots"].get(pair)
+            if existing_p:
+                existing_p["principal_usdt"] = principal
+                existing_p["skim_target_pct"] = skim_pct
+                existing_p["stop_reset_pct"] = stop_reset_pct
+                existing_p["rebuy_pullback_pct"] = pullback_pct
+                if custom_ep > 0:
+                    existing_p["entry_price"] = custom_ep
+                add_log(f"Updated PAPER Study Slot: {pair} (${principal:.2f} | +{skim_pct}% Skim)")
+            else:
+                STATE["paper_slots"][pair] = make_slot(pair, principal, skim_pct, stop_reset_pct, pullback_pct, custom_ep, "PAPER")
+                add_log(f"🧪 Added PAPER Study Slot: {pair} (${principal:.2f} from $100 Virtual Account | +{skim_pct}% Skim)")
+
+        save_state()
+
+    run_fleet_cycle(force_manual=True)
+    return jsonify({"ok": True, "pair": pair, "engine": target_engine})
+
+
+@app.route("/api/load_paper_study_pack", methods=["POST"])
+def api_load_paper_study_pack():
+    study_coins = [
+        "DOGE_USDT", "SUI_USDT", "SOL_USDT", "ADA_USDT", "TRX_USDT",
+        "ALGO_USDT", "POL_USDT", "VET_USDT", "XLM_USDT", "LINK_USDT"
+    ]
+    with state_lock:
+        if "paper_slots" not in STATE:
+            STATE["paper_slots"] = {}
+        for c in study_coins:
+            if c not in STATE["paper_slots"]:
+                STATE["paper_slots"][c] = make_slot(c, 10.0, 1.0, 99.0, 0.30, 0.0, "PAPER")
+        add_log("🧪 Loaded 10 Moving Study Coins ($10 x 10 = $100 Virtual Bankroll) into Paper Study Lab!")
+        save_state()
+    run_fleet_cycle(force_manual=True)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/remove_slot", methods=["POST"])
+def api_remove_slot():
+    data = request.json or {}
+    pair = normalize_pair(data.get("pair", ""))
+    engine = (data.get("engine") or "LIVE").upper()
+    with state_lock:
+        if engine == "PAPER":
+            if pair in STATE.get("paper_slots", {}):
+                del STATE["paper_slots"][pair]
+                add_log(f"🧪 Removed {pair} from Paper Study Lab.")
+                save_state()
+        else:
+            if pair in STATE["slots"]:
+                del STATE["slots"][pair]
+                add_log(f"Removed {pair} from Live Fleet.")
+                save_state()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/clear_paper_slots", methods=["POST"])
+def api_clear_paper_slots():
+    with state_lock:
+        STATE["paper_slots"] = {}
+        STATE["paper_free_usdt"] = 100.0
+        add_log("🧹 Cleared all Paper Study tokens — Paper Lab is 100% empty ($100.00 Virtual Bankroll ready).")
+        save_state()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/clear_all_slots", methods=["POST"])
+def api_clear_all_slots():
+    with state_lock:
+        STATE["slots"] = {}
+        add_log("🧹 Cleared all Live token slots.")
+        save_state()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/reset_slot_entry", methods=["POST"])
+def api_reset_slot_entry():
+    data = request.json or {}
+    pair = normalize_pair(data.get("pair", ""))
+    engine = (data.get("engine") or "LIVE").upper()
+    with state_lock:
+        target_dict = STATE.get("paper_slots", {}) if engine == "PAPER" else STATE["slots"]
+        slot = target_dict.get(pair)
+        if slot and slot["last_price"] > 0:
+            slot["entry_price"] = slot["last_price"]
+            slot["actual_cost_usdt"] = 0.0
+            add_log(f"[{engine}][{pair}] Entry Floor synced to live price: {fmt_px(slot['entry_price'])}")
+            save_state()
+    run_fleet_cycle(force_manual=True)
+    return jsonify({"ok": True})
+
+
+HTML_UI = """
+<!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<meta name="theme-color" content="#0f172a" />
-<link rel="manifest" href="/manifest.json" />
-<title>KeeperPulse v4.0 — Flash-Loan Liquidator & Dual-Core Master</title>
-<script src="https://cdn.tailwindcss.com"></script>
-<style>
-  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&family=JetBrains+Mono:wght@400;600;700&display=swap');
-  body {
-    background: radial-gradient(circle at 50% 0%, #0f172a 0%, #050811 75%);
-    color: #f8fafc;
-    font-family: 'Inter', sans-serif;
-    min-height: 100vh;
-  }
-  .mono { font-family: 'JetBrains Mono', monospace; }
-  .card {
-    background: rgba(12, 18, 32, 0.90);
-    border: 1px solid rgba(148, 163, 184, 0.15);
-    border-radius: 1rem;
-  }
-</style>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <meta name="theme-color" content="#060b16" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <link rel="manifest" href="/manifest.json" />
+  <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+  <link rel="apple-touch-icon" href="/icon.svg" />
+  <title>VaultSkimmer v5.8.2 | Verified Fill + 180s Smart Rebuy</title>
+  <style>
+    :root {
+      --bg: #050811;
+      --card: rgba(13, 20, 36, 0.92);
+      --border: #1e293b;
+      --emerald: #10b981;
+      --emerald-glow: rgba(16, 185, 129, 0.28);
+      --cyan: #06b6d4;
+      --amber: #f59e0b;
+      --purple: #8b5cf6;
+      --danger: #ef4444;
+      --text: #f8fafc;
+      --muted: #94a3b8;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Inter', -apple-system, system-ui, sans-serif; }
+    body {
+      background: radial-gradient(circle at 50% 0%, #0f1d3a 0%, #050811 70%);
+      color: var(--text); padding: 14px; min-height: 100vh;
+    }
+    .wrap { max-width: 1200px; margin: 0 auto; }
+
+    .hero {
+      background: linear-gradient(135deg, rgba(16,185,129,0.14), rgba(6,182,212,0.08));
+      border: 1px solid rgba(16,185,129,0.4); border-radius: 18px; padding: 16px 20px; margin-bottom: 14px;
+      box-shadow: 0 14px 34px rgba(0,0,0,0.5);
+    }
+    .hero-top { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 12px; }
+    .brand-title { font-size: 1.5rem; font-weight: 900; display: flex; align-items: center; gap: 9px; }
+    .v-badge { background: var(--emerald); color: #022c22; font-size: 0.72rem; font-weight: 900; padding: 3px 9px; border-radius: 99px; }
+    .sub-desc { color: var(--muted); font-size: 0.8rem; margin-top: 4px; }
+
+    .top-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .btn-pwa {
+      background: linear-gradient(135deg, #06b6d4, #3b82f6); color: #fff;
+      font-weight: 900; font-size: 0.77rem; padding: 9px 13px; border-radius: 10px; border: none;
+      cursor: pointer; display: inline-flex; align-items: center; gap: 6px;
+      box-shadow: 0 0 16px rgba(6, 182, 212, 0.35);
+    }
+    .btn-install {
+      background: linear-gradient(135deg, #10b981, #06b6d4); color: #022c22;
+      font-weight: 900; font-size: 0.77rem; padding: 9px 13px; border-radius: 10px; border: none;
+      cursor: pointer; display: inline-flex; align-items: center; gap: 6px;
+      box-shadow: 0 0 16px var(--emerald-glow);
+    }
+    .btn-study {
+      background: rgba(245, 158, 11, 0.2); border: 1px solid #f59e0b; color: #fde68a;
+      font-weight: 800; font-size: 0.77rem; padding: 8px 13px; border-radius: 10px; cursor: pointer;
+    }
+    .btn-scan {
+      background: rgba(139, 92, 246, 0.22); border: 1px solid #8b5cf6; color: #ddd6fe;
+      font-weight: 800; font-size: 0.77rem; padding: 8px 13px; border-radius: 10px; cursor: pointer;
+    }
+
+    .telemetry-strip {
+      display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center;
+      margin-top: 12px; padding-top: 12px; border-top: 1px solid rgba(255,255,255,0.08);
+      font-size: 0.79rem; color: var(--muted); gap: 8px;
+    }
+    .pill {
+      display: inline-flex; align-items: center; gap: 7px; padding: 5px 13px; border-radius: 99px;
+      font-weight: 800; font-size: 0.74rem;
+    }
+    .pill-live { background: rgba(16,185,129,0.2); color: #34d399; border: 1px solid #10b981; }
+    .pill-paper { background: rgba(245,158,11,0.18); color: #fbbf24; border: 1px solid #f59e0b; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; animation: pulse 1.2s infinite; }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
+
+    .grid-4 { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin-bottom: 14px; }
+    .card {
+      background: var(--card); border: 1px solid var(--border); border-radius: 15px; padding: 15px 16px;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.35);
+    }
+    .lbl { color: var(--muted); font-size: 0.7rem; font-weight: 800; text-transform: uppercase; letter-spacing: 0.6px; display: flex; justify-content: space-between; align-items: center; }
+    .val { font-size: 1.45rem; font-weight: 900; margin: 6px 0 4px; font-variant-numeric: tabular-nums; }
+    .sub { font-size: 0.77rem; color: var(--muted); }
+    .c-green { color: #34d399; }
+    .c-cyan { color: #22d3ee; }
+    .c-amber { color: #fbbf24; }
+
+    .btn-reset-vault {
+      background: rgba(239, 68, 68, 0.16); color: #fca5a5; border: 1px solid rgba(239, 68, 68, 0.45);
+      padding: 3px 8px; border-radius: 7px; font-size: 0.66rem; font-weight: 800; cursor: pointer;
+    }
+
+    .api-card {
+      background: linear-gradient(135deg, rgba(13, 20, 36, 0.96), rgba(15, 29, 58, 0.88));
+      border: 1px solid #263554; border-radius: 15px; padding: 15px 18px; margin-bottom: 16px;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+    }
+    .api-header { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; margin-bottom: 11px; gap: 8px; }
+    .api-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 10px; align-items: end; }
+    .btn-sync-api {
+      background: linear-gradient(135deg, #06b6d4, #10b981); color: #022c22;
+      font-weight: 900; font-size: 0.84rem; padding: 11px 16px; border-radius: 10px; border: none;
+      cursor: pointer; width: 100%; box-shadow: 0 0 15px rgba(6,182,212,0.28);
+    }
+
+    .fleet-header { font-size: 0.88rem; font-weight: 900; text-transform: uppercase; color: #38bdf8; margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }
+    .fleet-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 12px; margin-bottom: 18px; }
+    .empty-fleet {
+      background: rgba(13, 20, 36, 0.65); border: 1px dashed #334155; border-radius: 15px;
+      padding: 24px 18px; text-align: center; color: var(--muted); font-size: 0.84rem; margin-bottom: 16px;
+    }
+    .slot-card {
+      background: linear-gradient(180deg, rgba(16, 26, 48, 0.95), rgba(10, 15, 29, 0.95));
+      border: 1px solid #263554; border-radius: 15px; padding: 14px 16px;
+      box-shadow: 0 8px 22px rgba(0,0,0,0.4);
+    }
+    .slot-card-paper {
+      background: linear-gradient(180deg, rgba(34, 26, 16, 0.92), rgba(14, 12, 22, 0.95));
+      border: 1px solid rgba(245, 158, 11, 0.4); border-radius: 15px; padding: 14px 16px;
+      box-shadow: 0 8px 22px rgba(0,0,0,0.4);
+    }
+    .slot-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+    .slot-pair { font-size: 1.12rem; font-weight: 900; color: #fff; display: flex; align-items: center; gap: 8px; }
+    .slot-badge { font-size: 0.68rem; background: rgba(6,182,212,0.18); color: #22d3ee; border: 1px solid #06b6d4; padding: 2px 8px; border-radius: 99px; font-weight: 800; }
+    .slot-badge-paper { font-size: 0.68rem; background: rgba(245,158,11,0.18); color: #fbbf24; border: 1px solid #f59e0b; padding: 2px 8px; border-radius: 99px; font-weight: 800; }
+    .slot-metrics { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; font-size: 0.76rem; margin-bottom: 10px; background: rgba(5,8,17,0.6); padding: 9px 11px; border-radius: 10px; border: 1px solid #1e293b; }
+    .track { height: 10px; background: #04070e; border-radius: 99px; overflow: hidden; border: 1px solid #1e293b; margin: 7px 0; }
+    .fill { height: 100%; width: 0%; background: linear-gradient(90deg, #06b6d4, #10b981); transition: width 0.35s ease; }
+    .fill-paper { height: 100%; width: 0%; background: linear-gradient(90deg, #f59e0b, #10b981); transition: width 0.35s ease; }
+    .slot-actions { display: flex; justify-content: space-between; align-items: center; margin-top: 9px; gap: 6px; }
+    .s-btn { background: #1e293b; color: #cbd5e1; border: 1px solid #334155; padding: 5px 10px; border-radius: 8px; font-size: 0.72rem; font-weight: 800; cursor: pointer; }
+    .s-btn-del { background: rgba(239,68,68,0.15); color: #fca5a5; border: 1px solid rgba(239,68,68,0.4); }
+
+    .grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 14px; margin-bottom: 14px; }
+    .sec-title { font-size: 0.85rem; font-weight: 900; text-transform: uppercase; color: #38bdf8; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 6px; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px; }
+    label { display: block; font-size: 0.73rem; color: var(--muted); margin-bottom: 4px; font-weight: 700; }
+    input {
+      width: 100%; background: #050811; border: 1px solid #26334d; color: var(--text);
+      padding: 10px 11px; border-radius: 10px; font-size: 0.87rem; font-weight: 700;
+    }
+    .chip-bar { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+    .chip {
+      background: #111c33; border: 1px solid #26334d; color: #cbd5e1; font-size: 0.71rem;
+      font-weight: 800; padding: 5px 10px; border-radius: 99px; cursor: pointer;
+    }
+    .btns { display: flex; flex-wrap: wrap; gap: 9px; margin-top: 12px; }
+    button.ctrl { cursor: pointer; border: none; border-radius: 10px; padding: 11px 14px; font-weight: 800; font-size: 0.82rem; }
+    .b-save-live { background: linear-gradient(135deg, #10b981, #059669); color: #022c22; flex: 1; }
+    .b-save-paper { background: linear-gradient(135deg, #f59e0b, #d97706); color: #1e1b4b; flex: 1; }
+
+    table { width: 100%; border-collapse: collapse; font-size: 0.78rem; }
+    th, td { padding: 8px 6px; text-align: left; border-bottom: 1px solid #1e293b; font-variant-numeric: tabular-nums; }
+    th { color: var(--muted); font-size: 0.68rem; text-transform: uppercase; }
+    .logs {
+      background: #04070e; border: 1px solid #1e293b; border-radius: 11px; padding: 11px;
+      height: 215px; overflow-y: auto; font-family: monospace; font-size: 0.76rem; color: #cbd5e1; line-height: 1.55;
+    }
+  </style>
 </head>
-<body class="pb-16">
-<div class="max-w-5xl mx-auto px-4 pt-5 space-y-4">
-
-  <!-- TOP HEADER -->
-  <header class="card p-4">
-    <div class="flex flex-wrap items-center justify-between gap-2">
+<body>
+<div class="wrap">
+  <div class="hero">
+    <div class="hero-top">
       <div>
-        <div class="flex items-center gap-2">
-          <span class="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse"></span>
-          <h1 class="text-xl font-extrabold text-white">KeeperPulse <span class="text-emerald-400">v4.0</span></h1>
-          <span class="text-xs px-2.5 py-0.5 rounded-full bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 font-semibold">
-            Morpho 0%-Fee Flash Loans • Moonwell Wei Yield • Spot Skimmer
-          </span>
-        </div>
-        <p class="text-xs text-slate-400 mt-1">
-          Borrows Up to $50,000+ via Zero-Collateral Morpho Flash Loans for Atomic Micro-Liquidations & Bounties
-        </p>
+        <div class="brand-title">VaultSkimmer <span class="v-badge">v5.8.2 VERIFIED-FILL + 180s SMART REBUY</span></div>
+        <div class="sub-desc">True-Cash Anti-Dust Guard • Smart Rebuy (-0.30% Dip OR +0.50% Breakout OR 180s Timeout) • $100 Paper Study Lab</div>
       </div>
-      <div class="flex items-center gap-2">
-        <button onclick="installApp()" id="installBtn" class="px-3.5 py-2 rounded-lg text-xs font-extrabold bg-cyan-400 hover:bg-cyan-300 text-slate-950 shadow-lg">
-          📲 Install App
-        </button>
-        <div class="text-right text-xs">
-          <div class="text-slate-400">Last Scan: <span id="lastScanClock" class="mono text-emerald-400 font-bold">--:--:--</span> (<span id="scanMs" class="mono">0</span>ms)</div>
-          <div class="text-slate-500">ETH: <span id="ethPriceBadge" class="mono text-slate-300">$2294</span> • QNT: <span id="qntPriceBadge" class="mono text-cyan-300">$0</span></div>
-        </div>
+      <div class="top-actions">
+        <button class="btn-pwa" onclick="triggerInstall()" id="installBtn">📲 Install App</button>
+        <button class="btn-install" onclick="enablePullbackShield()">🛡️ Enable Smart Rebuy Shield on All Slots</button>
+        <button class="btn-study" onclick="loadPaperStudyPack()">🧪 Load 10 Study Coins ($100 Paper Lab)</button>
+        <button class="btn-scan" onclick="manualScan()" id="scanBtn">⚡ Scan All Now</button>
       </div>
     </div>
 
-    <!-- 6-CARD MASTER METRICS BAR -->
-    <div class="grid grid-cols-2 sm:grid-cols-6 gap-2.5 mt-4">
-      <div class="bg-slate-900/90 border border-slate-800 rounded-lg p-3">
-        <div class="text-[10px] uppercase text-slate-400">Base Gas (ETH)</div>
-        <div id="nativeEthPill" class="mono text-xs font-bold text-white mt-0.5">0.000547 ETH</div>
-        <div id="modePill" class="text-[10px] font-bold text-emerald-400 mt-0.5">🟢 DEFI ARMED</div>
+    <div class="telemetry-strip">
+      <div style="display:flex; gap:8px; flex-wrap:wrap;">
+        <span class="pill pill-live"><span class="dot"></span> LIVE FLEET (<span id="liveCount">0</span> TOKENS)</span>
+        <span class="pill pill-paper"><span class="dot"></span> PAPER STUDY LAB (<span id="paperCount">0</span> TOKENS | $100 BASE)</span>
       </div>
-      <div class="bg-slate-900/90 border border-emerald-500/40 rounded-lg p-3">
-        <div class="text-[10px] uppercase text-emerald-300">Moonwell Vault</div>
-        <div id="mwethAssetsPill" class="mono text-xs font-bold text-emerald-400 mt-0.5">0.00242538 ETH</div>
-        <div id="mwethUsdSub" class="mono text-[10px] text-white font-bold mt-0.5">$5.56 (+$0.10)</div>
-      </div>
-      <div class="bg-slate-900/90 border border-cyan-500/40 rounded-lg p-3">
-        <div class="text-[10px] uppercase text-cyan-300">On-Chain Wei Yield</div>
-        <div id="mwethEarnedPill" class="mono text-xs font-bold text-cyan-300 mt-0.5">+0 Wei</div>
-        <div id="mwethEarnedSub" class="mono text-[10px] text-emerald-400 mt-0.5">+0.000080 ETH</div>
-      </div>
-      <div class="bg-slate-900/90 border border-indigo-500/40 rounded-lg p-3">
-        <div class="text-[10px] uppercase text-indigo-300">Morpho 0% Flash Pool</div>
-        <div id="flashPoolPill" class="mono text-xs font-bold text-indigo-300 mt-0.5">$0 USDC Ready</div>
-        <div id="borrowersSub" class="mono text-[10px] text-slate-400 mt-0.5">0 Borrowers Tracked</div>
-      </div>
-      <div class="bg-slate-900/90 border border-amber-500/40 rounded-lg p-3">
-        <div class="text-[10px] uppercase text-amber-300">Gate.io Spot Skimmer</div>
-        <div id="skimStatusPill" class="mono text-xs font-bold text-amber-300 mt-0.5">PAPER SIM</div>
-        <div id="skimAnchorSub" class="mono text-[10px] text-slate-400 mt-0.5">Anchor: $0.00</div>
-      </div>
-      <div class="bg-slate-900/90 border border-emerald-500/40 rounded-lg p-3">
-        <div class="text-[10px] uppercase text-emerald-300">Combined Profits</div>
-        <div id="combinedProfitPill" class="mono text-sm font-extrabold text-emerald-400 mt-0.5">+$0.1021</div>
-        <div id="flipsWonSub" class="mono text-[10px] text-slate-400 mt-0.5">0 Skim Flips</div>
-      </div>
-    </div>
-  </header>
-
-  <!-- CORE 1: MORPHO FLASH-LOAN LIQUIDATOR & MOONWELL YIELD PANEL -->
-  <section class="card p-4 border-cyan-500/30">
-    <div class="flex flex-wrap items-center justify-between gap-2 mb-3">
-      <div>
-        <h2 class="text-xs font-bold uppercase tracking-wider text-cyan-300">
-          ⚡ Core 1: Morpho Blue Zero-Fee Flash Loan Liquidator + Moonwell Yield Engine
-        </h2>
-        <p class="text-[11px] text-slate-400">
-          Deploy KeeperGuardV3 (~$0.01 gas) to unlock `onMorphoFlashLoan` zero-collateral liquidations, or test the flash pool for free.
-        </p>
-      </div>
-      <div class="flex flex-wrap gap-2">
-        <button onclick="testFlashPool()" class="px-3 py-1.5 rounded-lg text-xs font-extrabold bg-indigo-500 hover:bg-indigo-400 text-white">
-          🧪 Verify Morpho 0% Flash Pool ($0)
-        </button>
-        <button onclick="deployGuard()" id="deployGuardBtn" class="px-3 py-1.5 rounded-lg text-xs font-extrabold bg-cyan-400 hover:bg-cyan-300 text-slate-950">
-          🛡️ 1-Click Deploy Flash-Loan GuardV3 (~$0.01)
-        </button>
-        <button onclick="triggerManualScan()" id="scanNowBtn" class="px-3 py-1.5 rounded-lg text-xs font-bold bg-slate-700 hover:bg-slate-600 text-white">
-          🔍 Scan Now
-        </button>
-        <button onclick="depositYield()" id="depYieldBtn" class="px-3 py-1.5 rounded-lg text-xs font-extrabold bg-emerald-500 hover:bg-emerald-400 text-slate-950">
-          💎 Deposit ETH
-        </button>
-        <button onclick="withdrawYield()" id="wdYieldBtn" class="px-3 py-1.5 rounded-lg text-xs font-bold bg-rose-600 hover:bg-rose-500 text-white">
-          📤 Withdraw 100% ETH
-        </button>
-        <button onclick="unwrapWeth()" class="px-3 py-1.5 rounded-lg text-xs font-bold bg-purple-600 hover:bg-purple-500 text-white">
-          🔄 Unwrap WETH
-        </button>
-        <button onclick="toggleLiveMode()" class="px-3 py-1.5 rounded-lg text-xs font-bold bg-amber-500 hover:bg-amber-400 text-slate-950">
-          🚀 Arm / Disarm DeFi
-        </button>
-      </div>
-    </div>
-
-    <div class="grid grid-cols-1 sm:grid-cols-4 gap-3 text-xs pt-2 border-t border-slate-800">
-      <div>
-        <label class="block text-slate-400 mb-1">Base Alchemy RPC URL (Synced)</label>
-        <input id="rpcInput" type="text" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-emerald-300 mono" />
-      </div>
-      <div>
-        <label class="block text-slate-400 mb-1">Keeper Wallet Private Key</label>
-        <input id="privKeyInput" type="password" placeholder="0x... (Saved on server)" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-white mono" />
-      </div>
-      <div>
-        <label class="block text-slate-400 mb-1">KeeperGuard Contract Address</label>
-        <input id="guardInput" type="text" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-emerald-300 mono" />
-      </div>
-      <div class="flex items-end">
-        <button onclick="saveConfig()" class="w-full py-2 px-4 rounded-lg text-xs font-extrabold bg-emerald-500 hover:bg-emerald-400 text-slate-950">
-          💾 Save & Sync All Settings
-        </button>
-      </div>
-    </div>
-  </section>
-
-  <!-- CORE 2: GATE.IO SPOT VOLATILITY SKIMMER PANEL -->
-  <section class="card p-4 border-amber-500/30">
-    <div class="flex flex-wrap items-center justify-between gap-2 mb-3">
-      <div>
-        <h2 class="text-xs font-bold uppercase tracking-wider text-amber-300">
-          📈 Core 2: Gate.io v4 Spot Volatility Skimmer (QNT/USDT & LTC/USDT)
-        </h2>
-      </div>
-      <div class="flex flex-wrap gap-2">
-        <button onclick="toggleSkimMode()" class="px-3.5 py-1.5 rounded-lg text-xs font-extrabold bg-amber-500 hover:bg-amber-400 text-slate-950">
-          🚀 Arm / Disarm Gate.io Spot Skimmer
-        </button>
-        <button onclick="resetSkimAnchor()" class="px-3 py-1.5 rounded-lg text-xs font-bold bg-slate-700 hover:bg-slate-600 text-white">
-          🎯 Reset Price Anchor
-        </button>
-      </div>
-    </div>
-
-    <div class="grid grid-cols-1 sm:grid-cols-5 gap-2.5 text-xs">
-      <div>
-        <label class="block text-slate-400 mb-1">Spot Pair</label>
-        <select id="skimPairSelect" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-2 text-white mono">
-          <option value="QNT_USDT">QNT_USDT (High Beta)</option>
-          <option value="LTC_USDT">LTC_USDT (Fast Cycles)</option>
-        </select>
-      </div>
-      <div>
-        <label class="block text-slate-400 mb-1">Order Size (USDT)</label>
-        <input id="skimOrderInput" type="number" step="5" value="25" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-2 text-white mono" />
-      </div>
-      <div>
-        <label class="block text-slate-400 mb-1">Buy Dip (%) / Take Profit (%)</label>
-        <div class="flex gap-1">
-          <input id="skimDipInput" type="number" step="0.1" value="1.2" class="w-1/2 bg-slate-900 border border-slate-700 rounded-lg px-2 py-2 text-emerald-300 mono" />
-          <input id="skimTpInput" type="number" step="0.1" value="1.3" class="w-1/2 bg-slate-900 border border-slate-700 rounded-lg px-2 py-2 text-cyan-300 mono" />
-        </div>
-      </div>
-      <div>
-        <label class="block text-slate-400 mb-1">Gate.io v4 API Key</label>
-        <input id="gateKeyInput" type="password" placeholder="Saved on server" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-2 text-white mono" />
-      </div>
-      <div>
-        <label class="block text-slate-400 mb-1">Gate.io v4 API Secret</label>
-        <input id="gateSecretInput" type="password" placeholder="Saved on server" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-2 text-white mono" />
-      </div>
-    </div>
-  </section>
-
-  <!-- TWO-COLUMN LEDGERS -->
-  <div class="grid grid-cols-1 lg:grid-cols-12 gap-4">
-    <div class="lg:col-span-6 card p-4">
-      <h3 class="text-xs font-bold uppercase tracking-wider text-emerald-300 mb-2">
-        🎯 Live Flash-Liquidation & Bounty Signals
-      </h3>
-      <div id="oppsList" class="space-y-2 max-h-72 overflow-y-auto"></div>
-    </div>
-
-    <div class="lg:col-span-6 card p-4">
-      <h3 class="text-xs font-bold uppercase tracking-wider text-cyan-300 mb-2">
-        🧾 Unified Yield, Flash-Liquidation & Spot Skim Ledger
-      </h3>
-      <div id="ledgerList" class="space-y-2 max-h-72 overflow-y-auto"></div>
+      <div>Last Dual Scan: <strong id="lastUpdate">--:--:--</strong> (<strong class="c-green" id="scanMs">0</strong>ms | Cycle #<span id="cycleNum">0</span>)</div>
     </div>
   </div>
 
-  <!-- LOGS -->
-  <section class="card p-4">
-    <h3 class="text-xs font-bold uppercase tracking-wider text-slate-300 mb-2">🛡️ Unified Master Engine Logs</h3>
-    <div id="logsBox" class="mono text-[11px] bg-slate-950 p-3 rounded-lg border border-slate-800 space-y-1 max-h-60 overflow-y-auto text-slate-300"></div>
-  </section>
+  <div class="api-card">
+    <div class="api-header">
+      <div class="sec-title" style="margin-bottom:0;">🔑 Gate.io v4 API Connection & Live Wallet Sync</div>
+      <div id="apiBadge" style="font-size:0.78rem; font-weight:800; color:var(--amber);">● Not Connected</div>
+    </div>
+    <div class="api-grid">
+      <div>
+        <label>Gate.io v4 API Key</label>
+        <input type="password" id="apiKeyInput" placeholder="Paste your Gate.io API Key..." autocomplete="off" />
+      </div>
+      <div>
+        <label>Gate.io v4 API Secret</label>
+        <input type="password" id="apiSecretInput" placeholder="Paste your Gate.io API Secret..." autocomplete="off" />
+      </div>
+      <div>
+        <button class="btn-sync-api" onclick="syncApiKeys()" id="syncApiBtn">🔗 Sync & Verify Gate.io API Keys</button>
+      </div>
+    </div>
+  </div>
 
+  <div class="grid-4">
+    <div class="card">
+      <div class="lbl">Live Protected Principal</div>
+      <div class="val c-cyan" id="totalPrincipal">$0.00</div>
+      <div class="sub">Live Fleet Value: <strong id="totalPosVal">$0.0000</strong></div>
+    </div>
+    <div class="card">
+      <div class="lbl">Total Live Portfolio (Fleet + USDT)</div>
+      <div class="val c-green" id="totalPortfolioVal">$0.0000</div>
+      <div class="sub">Free Gate.io USDT: <strong id="usdtBal">$0.00</strong></div>
+    </div>
+    <div class="card">
+      <div class="lbl">
+        <span>Realized LIVE Profit Vault</span>
+        <button class="btn-reset-vault" onclick="resetLiveVault()">🔄 Reset $0.00</button>
+      </div>
+      <div class="val c-green" id="liveSkimmed">+$0.0000</div>
+      <div class="sub">Verified Cash Skims: <strong id="liveSkimCount">0</strong></div>
+    </div>
+    <div class="card">
+      <div class="lbl">
+        <span>$100 Paper Study Profit Vault</span>
+        <button class="btn-reset-vault" onclick="resetPaperVault()">🔄 Reset $0.00</button>
+      </div>
+      <div class="val c-amber" id="paperSkimmed">+$0.0000</div>
+      <div class="sub">Paper Skims: <strong id="paperSkimCount">0</strong> | Virtual Cash: <strong class="c-amber" id="paperBankroll">$100.00</strong></div>
+    </div>
+  </div>
+
+  <!-- 1. LIVE ARMED CASH FLEET -->
+  <div class="fleet-header">
+    <span>💎 1. Active LIVE Cash Skimmer Fleet (Real Gate.io Funds)</span>
+    <button class="s-btn s-btn-del" onclick="clearAllSlots()" id="clearAllBtn" style="display:none;">🧹 Clear Live Slots</button>
+  </div>
+  <div id="liveFleetContainer"></div>
+
+  <!-- 2. INDEPENDENT $100 PAPER STUDY LAB -->
+  <div class="fleet-header" style="color:var(--amber);">
+    <span>🧪 2. Independent $100 Paper Study Lab (Track Moving Coins Day & Week — Never Touches Live Cash)</span>
+    <div style="display:flex; gap:8px;">
+      <button class="s-btn" onclick="loadPaperStudyPack()" style="border-color:var(--amber); color:#fde68a;">➕ Auto-Fill 10 Study Coins ($100)</button>
+      <button class="s-btn s-btn-del" onclick="clearPaperSlots()" id="clearPaperBtn" style="display:none;">🧹 Clear All Paper Tokens</button>
+    </div>
+  </div>
+  <div id="paperFleetContainer"></div>
+
+  <!-- 3. COMMAND CENTER + MOVING COIN STUDY LEADERBOARD -->
+  <div class="grid-2">
+    <div class="card">
+      <div class="sec-title">➕ Command Token to LIVE Fleet or PAPER Study Lab</div>
+
+      <label>Quick-Tap Popular Range & Moving Coins (Fills Symbol Box):</label>
+      <div class="chip-bar">
+        <span class="chip" onclick="fillTicker('PEPE_USDT')">PEPE</span>
+        <span class="chip" onclick="fillTicker('XRP_USDT')">XRP</span>
+        <span class="chip" onclick="fillTicker('DOGE_USDT')">DOGE</span>
+        <span class="chip" onclick="fillTicker('SUI_USDT')">SUI</span>
+        <span class="chip" onclick="fillTicker('SOL_USDT')">SOL</span>
+        <span class="chip" onclick="fillTicker('TRX_USDT')">TRX</span>
+        <span class="chip" onclick="fillTicker('ADA_USDT')">ADA</span>
+        <span class="chip" onclick="fillTicker('XLM_USDT')">XLM</span>
+        <span class="chip" onclick="fillTicker('POL_USDT')">POL</span>
+        <span class="chip" onclick="fillTicker('VET_USDT')">VET</span>
+        <span class="chip" onclick="fillTicker('ALGO_USDT')">ALGO</span>
+        <span class="chip" onclick="fillTicker('HYPE_USDT')">HYPE</span>
+      </div>
+
+      <div class="row">
+        <div>
+          <label>Token Symbol (Type Any Gate.io Coin)</label>
+          <input type="text" id="pairInput" placeholder="e.g. ALGO, DOGE, SUI, PEPE" value="" autocomplete="off" />
+        </div>
+        <div>
+          <label>Slot Principal (USDT)</label>
+          <input type="number" id="principalInput" step="0.05" placeholder="e.g. 10.35" value="10.35" autocomplete="off" />
+        </div>
+      </div>
+      <div class="row">
+        <div>
+          <label>Skim Profit Target (%)</label>
+          <input type="number" id="skimPctInput" step="0.05" placeholder="e.g. 1.0 or 0.65" value="1.0" autocomplete="off" />
+        </div>
+        <div>
+          <label>Auto Sell & Rebuy Drop % (99 = Hold Forever)</label>
+          <input type="number" id="stopResetInput" step="0.5" placeholder="99 = Never Sell at Loss" value="99.0" autocomplete="off" />
+        </div>
+      </div>
+      <div class="row">
+        <div>
+          <label>Rebuy Pullback % (Default = 0.30% Dip)</label>
+          <input type="number" id="pullbackInput" step="0.05" placeholder="0.30 = Dip or +0.5% Breakout (180s)" value="0.30" autocomplete="off" />
+        </div>
+        <div>
+          <label>Custom Entry Floor ($ — Blank = Auto)</label>
+          <input type="number" id="entryInput" step="0.00000001" placeholder="Auto-locks live price" value="" autocomplete="off" />
+        </div>
+      </div>
+      <div class="btns">
+        <button class="ctrl b-save-paper" onclick="addOrUpdateSlot('PAPER')" id="savePaperBtn">🧪 Launch in $100 PAPER Study Lab</button>
+        <button class="ctrl b-save-live" onclick="addOrUpdateSlot('LIVE')" id="saveLiveBtn">💎 Launch in LIVE Cash Fleet</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="sec-title">
+        <span>📊 Best Moving Coins Leaderboard (Day / Week Study)</span>
+      </div>
+      <div style="max-height: 310px; overflow-y: auto;">
+        <table>
+          <thead>
+            <tr>
+              <th>Rank & Coin</th>
+              <th>Mode</th>
+              <th>Skims Won</th>
+              <th>Vaulted Profit</th>
+              <th>24h Range %</th>
+            </tr>
+          </thead>
+          <tbody id="studyLeaderboardBody">
+            <tr><td colspan="5" style="color:#64748b; text-align:center; padding:22px;">Add Paper Study tokens to rank the fastest moving coins of the day/week.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- 4. DUAL LEDGERS (LIVE CASH LEDGER + PAPER STUDY LEDGER) -->
+  <div class="grid-2">
+    <div class="card">
+      <div class="sec-title">
+        <span>💎 Verified LIVE Cash Skim Ledger</span>
+        <button class="btn-reset-vault" onclick="resetLiveVault()">🧹 Clear Live Ledger</button>
+      </div>
+      <div style="max-height: 260px; overflow-y: auto;">
+        <table>
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Token Flip</th>
+              <th>Buy Cost → Net Sold</th>
+              <th>Cash Added</th>
+              <th>Rebought</th>
+            </tr>
+          </thead>
+          <tbody id="ledgerBody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="sec-title">
+        <span style="color:var(--amber);">🧪 Paper Study Skim Ledger ($100 Virtual Lab)</span>
+        <button class="btn-reset-vault" onclick="resetPaperVault()">🧹 Clear Paper Ledger</button>
+      </div>
+      <div style="max-height: 260px; overflow-y: auto;">
+        <table>
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Paper Flip</th>
+              <th>Sim Buy → Sim Sell</th>
+              <th>Sim Profit</th>
+              <th>Rebought</th>
+            </tr>
+          </thead>
+          <tbody id="paperLedgerBody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="sec-title">📡 Multi-Token Fleet Telemetry Logs</div>
+    <div class="logs" id="logBox"></div>
+  </div>
 </div>
 
 <script>
-let deferredPrompt = null;
-if ('serviceWorker' in navigator) {
-  navigator.serviceWorker.register('/sw.js').catch(() => {});
-}
-window.addEventListener('beforeinstallprompt', (e) => {
-  e.preventDefault();
-  deferredPrompt = e;
-});
-
-async function installApp() {
-  if (deferredPrompt) {
-    deferredPrompt.prompt();
-    await deferredPrompt.userChoice;
-    deferredPrompt = null;
-  } else {
-    alert('To install KeeperPulse:\\n• Android Chrome: Tap the 3 dots (⋮) -> "Install app" or "Add to Home screen".\\n• Desktop: Click the install icon in the address bar.');
+  let deferredPrompt = null;
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('/sw.js').catch(() => {});
+    });
   }
-}
-
-async function pollState() {
-  try {
-    const r = await fetch('/state?_t=' + Date.now());
-    const s = await r.json();
-    const ethPx = Number(s.eth_price_usd || 2294);
-    document.getElementById('lastScanClock').textContent = s.last_scan_hms || '--:--:--';
-    document.getElementById('scanMs').textContent = s.last_scan_ms || 0;
-    document.getElementById('ethPriceBadge').textContent = '$' + ethPx.toFixed(2);
-    document.getElementById('qntPriceBadge').textContent = '$' + Number(s.qnt_price || 0).toFixed(2);
-    document.getElementById('nativeEthPill').textContent = Number(s.native_eth_balance || 0).toFixed(6) + ' ETH';
-
-    const modePill = document.getElementById('modePill');
-    modePill.textContent = s.live_armed ? '🟢 DEFI ARMED' : '🧪 DEFI DRY-RUN';
-    modePill.className = s.live_armed ? 'text-[10px] font-extrabold text-emerald-400 mt-0.5' : 'text-[10px] font-extrabold text-amber-300 mt-0.5';
-
-    const mwEth = Number(s.mweth_assets_eth || 0);
-    const mwUsd = mwEth * ethPx;
-    const pnlUsd = Number(s.position_pnl_usd || 0);
-    document.getElementById('mwethAssetsPill').textContent = mwEth.toFixed(8) + ' ETH';
-    document.getElementById('mwethUsdSub').textContent = '$' + mwUsd.toFixed(2) + ' (+$' + pnlUsd.toFixed(2) + ')';
-
-    const earnedWei = Number(s.mweth_earned_wei || 0);
-    const earnedEth = Number(s.mweth_earned_eth || 0);
-    document.getElementById('mwethEarnedPill').textContent = '+' + earnedWei.toLocaleString() + ' Wei';
-    document.getElementById('mwethEarnedSub').textContent = '+' + earnedEth.toFixed(8) + ' ETH';
-
-    const flashUsdc = Number(s.morpho_flash_pool_usdc || 0);
-    document.getElementById('flashPoolPill').textContent = '$' + (flashUsdc > 1000 ? (flashUsdc/1000).toFixed(1) + 'K' : flashUsdc.toFixed(0)) + ' USDC Ready';
-    document.getElementById('borrowersSub').textContent = (s.borrowers_tracked || 0) + ' Borrowers (' + (s.underwater_found || 0) + ' Underwater)';
-
-    const skimStatus = document.getElementById('skimStatusPill');
-    if (s.skim_active_entry > 0) {
-      skimStatus.textContent = 'HOLDING @ $' + Number(s.skim_active_entry).toFixed(2);
-      skimStatus.className = 'mono text-xs font-extrabold text-cyan-300 mt-0.5';
-    } else {
-      skimStatus.textContent = s.skim_armed ? '🟢 SKIM ARMED' : '🧪 PAPER SIM';
-      skimStatus.className = s.skim_armed ? 'mono text-xs font-extrabold text-emerald-400 mt-0.5' : 'mono text-xs font-bold text-amber-300 mt-0.5';
-    }
-    document.getElementById('skimAnchorSub').textContent = 'Anchor: $' + Number(s.skim_anchor_price || 0).toFixed(2);
-
-    const totalCombined = pnlUsd + Number(s.realized_profit_usd || 0) + Number(s.skim_realized_usd || 0);
-    document.getElementById('combinedProfitPill').textContent = '+$' + totalCombined.toFixed(4);
-    document.getElementById('flipsWonSub').textContent = (s.skim_flips_won || 0) + ' Skim Flips Won';
-
-    const rpcInput = document.getElementById('rpcInput');
-    if (document.activeElement !== rpcInput && s.rpc_url) rpcInput.value = s.rpc_url;
-    const guardInput = document.getElementById('guardInput');
-    if (document.activeElement !== guardInput && s.guard_contract) guardInput.value = s.guard_contract;
-    const pairSel = document.getElementById('skimPairSelect');
-    if (document.activeElement !== pairSel && s.skim_pair) pairSel.value = s.skim_pair;
-    const orderIn = document.getElementById('skimOrderInput');
-    if (document.activeElement !== orderIn && s.skim_order_usd) orderIn.value = s.skim_order_usd;
-    const dipIn = document.getElementById('skimDipInput');
-    if (document.activeElement !== dipIn && s.skim_dip_pct) dipIn.value = s.skim_dip_pct;
-    const tpIn = document.getElementById('skimTpInput');
-    if (document.activeElement !== tpIn && s.skim_tp_pct) tpIn.value = s.skim_tp_pct;
-
-    const opps = s.live_opportunities || [];
-    const oppsEl = document.getElementById('oppsList');
-    const pairPx = s.skim_pair === 'LTC_USDT' ? Number(s.ltc_price || 0) : Number(s.qnt_price || 0);
-    const nextBuyPx = Number(s.skim_anchor_price || pairPx) * (1 - Number(s.skim_dip_pct || 1.2) / 100);
-    const skimCard = `
-      <div class="p-2.5 rounded-lg bg-slate-900 border border-indigo-500/30 flex items-center justify-between text-xs">
-        <div>
-          <div class="font-bold text-indigo-300">Morpho Blue 0%-Fee Flash Liquidator</div>
-          <div class="mono text-[10px] text-slate-400">Scanning ${s.borrowers_tracked || 0} Moonwell Borrowers + ${s.vaults_monitored || 0} Non-HOD Vaults</div>
-        </div>
-        <div class="mono font-bold text-emerald-400">$0 Collateral</div>
-      </div>
-      <div class="p-2.5 rounded-lg bg-slate-900 border border-amber-500/30 flex items-center justify-between text-xs">
-        <div>
-          <div class="font-bold text-amber-300">Gate.io ${s.skim_pair} Volatility Skimmer</div>
-          <div class="mono text-[10px] text-slate-400">Live: $${pairPx.toFixed(2)} • Buy Trigger: $${nextBuyPx.toFixed(2)} (-${s.skim_dip_pct}%)</div>
-        </div>
-        <div class="mono font-bold text-emerald-400">+${s.skim_tp_pct}% Target</div>
-      </div>
-    `;
-    if (opps.length === 0) {
-      oppsEl.innerHTML = skimCard;
-    } else {
-      oppsEl.innerHTML = skimCard + opps.map(o => `
-        <div class="p-2.5 rounded-lg bg-slate-900 border border-emerald-500/30 flex items-center justify-between text-xs">
-          <div>
-            <div class="font-bold text-white">${o.name}</div>
-            <div class="mono text-[10px] text-slate-400">Bounty: $${o.bounty_usd.toFixed(4)} • Gas: $${o.gas_usd.toFixed(4)}</div>
-          </div>
-          <div class="mono font-extrabold text-emerald-400">+$${o.net_profit_usd.toFixed(4)}</div>
-        </div>
-      `).join('');
-    }
-
-    const ledger = s.harvest_ledger || [];
-    const ledgerEl = document.getElementById('ledgerList');
-    ledgerEl.innerHTML = ledger.map(l => `
-      <div class="p-2.5 rounded-lg bg-slate-900 border border-emerald-500/30 flex items-center justify-between text-xs">
-        <div>
-          <span class="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-bold mr-1">${l.mode}</span>
-          <span class="font-bold text-white">${l.vault}</span>
-          <div class="mono text-[10px] text-slate-400 mt-0.5">${l.strategy} • ${l.time}</div>
-        </div>
-        <div class="mono font-bold text-emerald-400">$${Number(l.net_usd).toFixed(4)}</div>
-      </div>
-    `).join('');
-
-    document.getElementById('logsBox').innerHTML = (s.logs || []).map(l => `<div>${l}</div>`).join('');
-  } catch (e) {}
-}
-
-async function saveConfig() {
-  const rpc = document.getElementById('rpcInput').value.trim();
-  const pk = document.getElementById('privKeyInput').value.trim();
-  const guard = document.getElementById('guardInput').value.trim();
-  const skimPair = document.getElementById('skimPairSelect').value;
-  const skimOrder = parseFloat(document.getElementById('skimOrderInput').value || '25');
-  const skimDip = parseFloat(document.getElementById('skimDipInput').value || '1.2');
-  const skimTp = parseFloat(document.getElementById('skimTpInput').value || '1.3');
-  const gateKey = document.getElementById('gateKeyInput').value.trim();
-  const gateSecret = document.getElementById('gateSecretInput').value.trim();
-
-  await fetch('/configure', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      rpc_url: rpc,
-      private_key: pk,
-      guard_contract: guard,
-      skim_pair: skimPair,
-      skim_order_usd: skimOrder,
-      skim_dip_pct: skimDip,
-      skim_tp_pct: skimTp,
-      gate_api_key: gateKey,
-      gate_api_secret: gateSecret
-    })
+  window.addEventListener('beforeinstallprompt', (e) => {
+    e.preventDefault();
+    deferredPrompt = e;
   });
-  document.getElementById('privKeyInput').value = '';
-  document.getElementById('gateKeyInput').value = '';
-  document.getElementById('gateSecretInput').value = '';
-  pollState();
-}
 
-async function testFlashPool() {
-  const r = await fetch('/test_flash_pool', { method: 'POST' });
-  const res = await r.json();
-  alert(res.message);
-  pollState();
-}
-
-async function toggleSkimMode() {
-  await saveConfig();
-  const r = await fetch('/toggle_skim', { method: 'POST' });
-  const res = await r.json();
-  if (res.message) alert(res.message);
-  pollState();
-}
-
-async function resetSkimAnchor() {
-  await fetch('/reset_anchor', { method: 'POST' });
-  pollState();
-}
-
-async function triggerManualScan() {
-  const btn = document.getElementById('scanNowBtn');
-  btn.textContent = '⏳...';
-  await fetch('/scan_now', { method: 'POST' });
-  btn.textContent = '🔍 Scan Now';
-  pollState();
-}
-
-async function depositYield() {
-  const pk = document.getElementById('privKeyInput').value.trim();
-  if (pk) await saveConfig();
-  const r = await fetch('/deposit_yield', { method: 'POST' });
-  const res = await r.json();
-  alert(res.message);
-  pollState();
-}
-
-async function withdrawYield() {
-  const pk = document.getElementById('privKeyInput').value.trim();
-  if (pk) await saveConfig();
-  const r = await fetch('/withdraw_yield', { method: 'POST' });
-  const res = await r.json();
-  alert(res.message);
-  pollState();
-}
-
-async function unwrapWeth() {
-  const pk = document.getElementById('privKeyInput').value.trim();
-  if (pk) await saveConfig();
-  const r = await fetch('/unwrap_weth', { method: 'POST' });
-  const res = await r.json();
-  alert(res.message);
-  pollState();
-}
-
-async function deployGuard() {
-  const btn = document.getElementById('deployGuardBtn');
-  const pk = document.getElementById('privKeyInput').value.trim();
-  if (pk) await saveConfig();
-  btn.textContent = '⏳ Deploying GuardV3...';
-  btn.disabled = true;
-  try {
-    const r = await fetch('/deploy_guard', { method: 'POST' });
-    const res = await r.json();
-    alert(res.message);
-  } catch (e) {
-    alert('Error: ' + e);
+  async function triggerInstall() {
+    if (deferredPrompt) {
+      deferredPrompt.prompt();
+      const { outcome } = await deferredPrompt.userChoice;
+      if (outcome === 'accepted') {
+        deferredPrompt = null;
+      }
+    } else {
+      alert('To install VaultSkimmer as an app: On Android/Chrome tap the 3-dots menu -> "Install app". On Desktop Chrome/Edge click the Install icon on the right side of the address bar.');
+    }
   }
-  btn.textContent = '🛡️ 1-Click Deploy Flash-Loan GuardV3 (~$0.01)';
-  btn.disabled = false;
-  pollState();
-}
 
-async function toggleLiveMode() {
-  const r = await fetch('/toggle_live', { method: 'POST' });
-  const res = await r.json();
-  if (!res.ok && res.message) alert(res.message);
-  pollState();
-}
+  async function enablePullbackShield() {
+    await fetch('/api/enable_pullback_shield', { method: 'POST' });
+    await refresh();
+    alert('🛡️ Smart Rebuy Shield enabled across all Live & Paper slots! After any skim, the bot holds USDT until a -0.30% dip OR +0.50% breakout OR 180s timer.');
+  }
 
-window.addEventListener('DOMContentLoaded', () => {
-  pollState();
-  setInterval(pollState, 3000);
-});
+  function fmtPx(val) {
+    const v = Number(val || 0);
+    if (v === 0) return '$0.0000';
+    if (v < 0.0001) return '$' + v.toFixed(8);
+    if (v < 0.01) return '$' + v.toFixed(6);
+    return '$' + v.toFixed(4);
+  }
+
+  function fillTicker(pair) {
+    document.getElementById('pairInput').value = pair;
+  }
+
+  function loadSlotToForm(pair, principal, skimPct, stopPct, pullback) {
+    document.getElementById('pairInput').value = pair;
+    document.getElementById('principalInput').value = principal;
+    document.getElementById('skimPctInput').value = skimPct;
+    document.getElementById('stopResetInput').value = stopPct || 99.0;
+    document.getElementById('pullbackInput').value = pullback;
+    document.getElementById('entryInput').value = '';
+  }
+
+  async function loadPaperStudyPack() {
+    await fetch('/api/load_paper_study_pack', { method: 'POST' });
+    await refresh();
+  }
+
+  async function clearPaperSlots() {
+    await fetch('/api/clear_paper_slots', { method: 'POST' });
+    await refresh();
+  }
+
+  async function resetLiveVault() {
+    await fetch('/api/reset_live_vault', { method: 'POST' });
+    await refresh();
+  }
+
+  async function resetPaperVault() {
+    await fetch('/api/reset_paper_vault', { method: 'POST' });
+    await refresh();
+  }
+
+  async function syncApiKeys() {
+    const btn = document.getElementById('syncApiBtn');
+    const keyVal = document.getElementById('apiKeyInput').value.trim();
+    const secretVal = document.getElementById('apiSecretInput').value.trim();
+    btn.innerText = 'Verifying with Gate.io...';
+
+    const r = await fetch('/api/sync_keys', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ api_key: keyVal, api_secret: secretVal })
+    });
+    const d = await r.json();
+    if (d.ok) {
+      document.getElementById('apiKeyInput').value = '';
+      document.getElementById('apiSecretInput').value = '';
+      document.getElementById('apiKeyInput').placeholder = 'Saved & Verified on Server';
+      document.getElementById('apiSecretInput').placeholder = 'Saved & Verified on Server';
+      btn.innerText = '✅ Connected ($' + Number(d.usdt_balance).toFixed(2) + ' USDT)';
+    } else {
+      alert('Gate.io API Notice: ' + (d.error || 'Check your Key & Secret'));
+      btn.innerText = '❌ Sync Failed — Retry';
+    }
+    await refresh();
+    setTimeout(() => { btn.innerText = '🔗 Sync & Verify Gate.io API Keys'; }, 2500);
+  }
+
+  async function addOrUpdateSlot(targetEngine) {
+    const pair = document.getElementById('pairInput').value.trim();
+    const prin = document.getElementById('principalInput').value.trim();
+    const skim = document.getElementById('skimPctInput').value.trim();
+    const stopPct = document.getElementById('stopResetInput').value.trim();
+    const pb = document.getElementById('pullbackInput').value.trim();
+    const ep = document.getElementById('entryInput').value.trim();
+
+    if (!pair || !prin || !skim) {
+      alert('Please enter Token Symbol, Principal (USDT), and Skim Profit Target (%) first.');
+      return;
+    }
+
+    const r = await fetch('/api/add_or_update_slot', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        target_engine: targetEngine,
+        pair: pair,
+        principal_usdt: prin,
+        skim_target_pct: skim,
+        stop_reset_pct: stopPct || '99.0',
+        rebuy_pullback_pct: pb || '0.30',
+        entry_price: ep
+      })
+    });
+    const d = await r.json();
+    if (!d.ok) {
+      alert(d.error || 'Could not add slot');
+      return;
+    }
+    document.getElementById('pairInput').value = '';
+    document.getElementById('entryInput').value = '';
+    await refresh();
+  }
+
+  async function removeSlot(pair, engine) {
+    await fetch('/api/remove_slot', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ pair, engine })
+    });
+    await refresh();
+  }
+
+  async function clearAllSlots() {
+    await fetch('/api/clear_all_slots', { method: 'POST' });
+    await refresh();
+  }
+
+  async function resetSlotEntry(pair, engine) {
+    await fetch('/api/reset_slot_entry', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ pair, engine })
+    });
+    await refresh();
+  }
+
+  async function manualScan() {
+    const btn = document.getElementById('scanBtn');
+    btn.innerText = 'Scanning...';
+    await fetch('/api/scan_now', { method: 'POST' });
+    await refresh();
+    btn.innerText = '⚡ Scan All Now';
+  }
+
+  function renderSlotCards(slotsObj, engineType, needBuf) {
+    const keys = Object.keys(slotsObj);
+    return keys.map(pair => {
+      const sl = slotsObj[pair];
+      const p = Number(sl.principal_usdt || 0);
+      const skimPct = Number(sl.skim_target_pct || 1.0);
+      const stopPct = Number(sl.stop_reset_pct || 99.0);
+      const pbPct = Number(sl.rebuy_pullback_pct !== undefined ? sl.rebuy_pullback_pct : 0.30);
+      const needPct = skimPct + needBuf;
+      const prog = Math.max(0, Math.min(100, (Number(sl.unrealized_pnl_pct || 0) / needPct) * 100));
+      const pnlSign = sl.unrealized_pnl_pct >= 0 ? '+' : '';
+      const isPaper = engineType === 'PAPER';
+
+      return `
+        <div class="${isPaper ? 'slot-card-paper' : 'slot-card'}">
+          <div class="slot-top">
+            <div class="slot-pair">
+              <span>${pair}</span>
+              <span class="${isPaper ? 'slot-badge-paper' : 'slot-badge'}">${isPaper ? 'PAPER $' : 'LIVE $'}${p.toFixed(2)}</span>
+            </div>
+            <div style="font-size:0.78rem; font-weight:800;" class="${sl.unrealized_pnl_pct >= 0 ? 'c-green' : 'c-amber'}">
+              Live: ${fmtPx(sl.last_price)} (${pnlSign}${Number(sl.unrealized_pnl_pct).toFixed(2)}%)
+            </div>
+          </div>
+
+          <div class="slot-metrics">
+            <div>Entry Floor: <strong>${fmtPx(sl.entry_price)}</strong></div>
+            <div>+${skimPct}% Target: <strong class="c-cyan">${fmtPx(sl.target_sell_price)}</strong></div>
+            <div>Smart Rebuy: <strong class="c-amber">-${pbPct}% Dip / +0.5% / 180s</strong></div>
+            <div>Slot Vaulted: <strong class="c-green">+$${Number(sl.slot_skimmed_usdt || 0).toFixed(4)} (${sl.slot_skim_count || 0})</strong></div>
+          </div>
+
+          <div style="display:flex; justify-content:space-between; font-size:0.73rem; color:var(--muted);">
+            <span>${sl.status_msg}</span>
+            <strong class="c-green">${prog.toFixed(1)}%</strong>
+          </div>
+          <div class="track"><div class="${isPaper ? 'fill-paper' : 'fill'}" style="width:${prog.toFixed(1)}%"></div></div>
+
+          <div class="slot-actions">
+            <button class="s-btn" onclick="loadSlotToForm('${pair}', ${p}, ${skimPct}, ${stopPct}, ${pbPct})">✏️ Edit</button>
+            <button class="s-btn" onclick="resetSlotEntry('${pair}', '${engineType}')">🔄 Sync Entry</button>
+            <button class="s-btn s-btn-del" onclick="removeSlot('${pair}', '${engineType}')">🗑️ Remove</button>
+          </div>
+        </div>
+      `;
+    }).join('');
+  }
+
+  async function refresh() {
+    try {
+      const r = await fetch('/api/state');
+      const s = await r.json();
+
+      document.getElementById('lastUpdate').innerText = s.last_update;
+      document.getElementById('scanMs').innerText = s.last_scan_ms;
+      document.getElementById('cycleNum').innerText = s.cycle_count || 0;
+
+      const apiBadge = document.getElementById('apiBadge');
+      if (s.api_connected) {
+        apiBadge.style.color = '#34d399';
+        apiBadge.innerText = '● ' + (s.api_status_msg || 'Connected to Gate.io');
+      } else {
+        apiBadge.style.color = '#fbbf24';
+        apiBadge.innerText = '● ' + (s.api_status_msg || 'Not Connected');
+      }
+      if (s.has_saved_keys && !document.getElementById('apiKeyInput').value) {
+        document.getElementById('apiKeyInput').placeholder = 'Saved & Verified on Server';
+        document.getElementById('apiSecretInput').placeholder = 'Saved & Verified on Server';
+      }
+
+      const liveSlots = s.slots || {};
+      const paperSlots = s.paper_slots || {};
+      const liveKeys = Object.keys(liveSlots);
+      const paperKeys = Object.keys(paperSlots);
+
+      document.getElementById('liveCount').innerText = liveKeys.length;
+      document.getElementById('paperCount').innerText = paperKeys.length;
+      document.getElementById('clearAllBtn').style.display = liveKeys.length > 0 ? 'inline-block' : 'none';
+      document.getElementById('clearPaperBtn').style.display = paperKeys.length > 0 ? 'inline-block' : 'none';
+
+      const needBuf = Number(s.fee_buffer_pct || 0.25);
+
+      let sumPrincipal = 0;
+      let sumPosVal = 0;
+      liveKeys.forEach(k => {
+        sumPrincipal += Number(liveSlots[k].principal_usdt || 0);
+        sumPosVal += Number(liveSlots[k].position_value_usdt || 0);
+      });
+
+      if (liveKeys.length === 0) {
+        document.getElementById('liveFleetContainer').innerHTML = `<div class="empty-fleet">No Live tokens running — Command a token below and click "💎 Launch in LIVE Cash Fleet".</div>`;
+      } else {
+        document.getElementById('liveFleetContainer').innerHTML = `<div class="fleet-grid">${renderSlotCards(liveSlots, 'LIVE', needBuf)}</div>`;
+      }
+
+      if (paperKeys.length === 0) {
+        document.getElementById('paperFleetContainer').innerHTML = `
+          <div class="empty-fleet">Paper Study Lab is empty ($100.00 Virtual Bankroll Ready) — Tap "🧪 Load 10 Study Coins ($100 Paper Lab)" or add any coin below to study daily movers!</div>
+        `;
+      } else {
+        document.getElementById('paperFleetContainer').innerHTML = `<div class="fleet-grid">${renderSlotCards(paperSlots, 'PAPER', needBuf)}</div>`;
+      }
+
+      const freeUsdt = Number(s.usdt_balance || 0);
+      document.getElementById('totalPrincipal').innerText = '$' + sumPrincipal.toFixed(2);
+      document.getElementById('totalPosVal').innerText = '$' + sumPosVal.toFixed(4);
+      document.getElementById('totalPortfolioVal').innerText = '$' + (sumPosVal + freeUsdt).toFixed(4);
+      document.getElementById('liveSkimmed').innerText = '+$' + Number(s.live_skimmed_usdt || 0).toFixed(4);
+      document.getElementById('liveSkimCount').innerText = s.live_skim_count || 0;
+      document.getElementById('paperSkimmed').innerText = '+$' + Number(s.paper_skimmed_usdt || 0).toFixed(4);
+      document.getElementById('paperSkimCount').innerText = s.paper_skim_count || 0;
+      document.getElementById('paperBankroll').innerText = '$' + (100 + Number(s.paper_skimmed_usdt || 0)).toFixed(2);
+      document.getElementById('usdtBal').innerText = '$' + freeUsdt.toFixed(2);
+
+      const allTracked = [
+        ...liveKeys.map(k => ({ ...liveSlots[k], modeLabel: 'LIVE' })),
+        ...paperKeys.map(k => ({ ...paperSlots[k], modeLabel: 'PAPER' }))
+      ].sort((a, b) => {
+        if ((b.slot_skim_count || 0) !== (a.slot_skim_count || 0)) {
+          return (b.slot_skim_count || 0) - (a.slot_skim_count || 0);
+        }
+        return (b.range_24h_pct || 0) - (a.range_24h_pct || 0);
+      });
+
+      const rankBody = document.getElementById('studyLeaderboardBody');
+      if (allTracked.length > 0) {
+        rankBody.innerHTML = allTracked.map((item, idx) => `
+          <tr>
+            <td><strong>#${idx + 1} ${item.pair}</strong></td>
+            <td><span class="${item.modeLabel === 'LIVE' ? 'c-green' : 'c-amber'}"><strong>${item.modeLabel}</strong></span></td>
+            <td><strong>${item.slot_skim_count || 0} flips</strong></td>
+            <td class="c-green"><strong>+$${Number(item.slot_skimmed_usdt || 0).toFixed(4)}</strong></td>
+            <td class="c-cyan">${Number(item.range_24h_pct || 0).toFixed(2)}%</td>
+          </tr>
+        `).join('');
+      } else {
+        rankBody.innerHTML = `<tr><td colspan="5" style="color:#64748b; text-align:center; padding:22px;">Add Paper Study tokens to rank the fastest moving coins of the day/week.</td></tr>`;
+      }
+
+      const lb = document.getElementById('ledgerBody');
+      if (s.skim_ledger && s.skim_ledger.length > 0) {
+        lb.innerHTML = s.skim_ledger.map(i => `
+          <tr>
+            <td>${i.time}</td>
+            <td><strong>${i.cycle} ${i.pair}</strong></td>
+            <td>${i.buy_px} → ${i.sell_px}</td>
+            <td class="c-green"><strong>${i.profit}</strong></td>
+            <td class="c-cyan">${i.principal_redeployed}</td>
+          </tr>
+        `).join('');
+      } else {
+        lb.innerHTML = `<tr><td colspan="5" style="color:#64748b; text-align:center; padding:18px;">No live skims yet.</td></tr>`;
+      }
+
+      const plb = document.getElementById('paperLedgerBody');
+      if (s.paper_ledger && s.paper_ledger.length > 0) {
+        plb.innerHTML = s.paper_ledger.map(i => `
+          <tr>
+            <td>${i.time}</td>
+            <td><strong>${i.cycle} ${i.pair}</strong></td>
+            <td>${i.buy_px} → ${i.sell_px}</td>
+            <td class="c-amber"><strong>${i.profit}</strong></td>
+            <td class="c-cyan">${i.principal_redeployed}</td>
+          </tr>
+        `).join('');
+      } else {
+        plb.innerHTML = `<tr><td colspan="5" style="color:#64748b; text-align:center; padding:18px;">Waiting for Paper Study tokens to hit skim target.</td></tr>`;
+      }
+
+      document.getElementById('logBox').innerHTML = (s.logs || []).join('<br/>');
+    } catch (e) {}
+  }
+
+  setInterval(refresh, 2500);
+  refresh();
 </script>
 </body>
 </html>
 """
 
 
-# ==============================================================================
-# 7. FLASK ROUTES
-# ==============================================================================
-@app.route("/manifest.json")
-def manifest():
-    return jsonify({
-        "name": "KeeperPulse v4.0 Flash-Loan & Dual-Core Engine",
-        "short_name": "KeeperPulse",
-        "start_url": "/",
-        "display": "standalone",
-        "background_color": "#050811",
-        "theme_color": "#0f172a",
-        "icons": [
-            {"src": "https://cryptologos.cc/logos/ethereum-eth-logo.png", "sizes": "192x192", "type": "image/png"},
-            {"src": "https://cryptologos.cc/logos/ethereum-eth-logo.png", "sizes": "512x512", "type": "image/png"}
-        ]
-    })
-
-
-@app.route("/sw.js")
-def service_worker():
-    return Response("self.addEventListener('fetch', function(event) {});", mimetype="application/javascript")
-
-
 @app.route("/")
 def index():
-    return render_template_string(KEEPER_UI_HTML)
-
-
-@app.route("/state")
-def get_state():
-    with state_lock:
-        resp = json.loads(json.dumps(STATE))
-        resp["private_key"] = ""
-        resp["gate_api_key"] = ""
-        resp["gate_api_secret"] = ""
-    return jsonify(resp)
-
-
-@app.route("/ping")
-def ping():
-    return "OK", 200
-
-
-@app.route("/test_flash_pool", methods=["POST"])
-def test_flash_pool_route():
-    ok, msg = simulate_morpho_flash_loan_check()
-    return jsonify({"ok": ok, "message": msg})
-
-
-@app.route("/configure", methods=["POST"])
-def configure():
-    data = request.get_json(force=True) or {}
-    with state_lock:
-        if data.get("rpc_url") and data["rpc_url"].strip():
-            STATE["rpc_url"] = data["rpc_url"].strip()
-        if data.get("private_key"):
-            STATE["private_key"] = data["private_key"].strip()
-        if data.get("guard_contract") and data["guard_contract"].strip():
-            STATE["guard_contract"] = data["guard_contract"].strip()
-        if data.get("skim_pair") in ("QNT_USDT", "LTC_USDT"):
-            if data["skim_pair"] != STATE.get("skim_pair"):
-                STATE["skim_anchor_price"] = 0.0
-            STATE["skim_pair"] = data["skim_pair"]
-        if data.get("skim_order_usd") is not None:
-            STATE["skim_order_usd"] = float(data["skim_order_usd"])
-        if data.get("skim_dip_pct") is not None:
-            STATE["skim_dip_pct"] = float(data["skim_dip_pct"])
-        if data.get("skim_tp_pct") is not None:
-            STATE["skim_tp_pct"] = float(data["skim_tp_pct"])
-        if data.get("gate_api_key"):
-            STATE["gate_api_key"] = data["gate_api_key"].strip()
-        if data.get("gate_api_secret"):
-            STATE["gate_api_secret"] = data["gate_api_secret"].strip()
-
-    sync_gate_spot_balances()
-    sync_wallet_balances()
-    run_unified_dual_core_cycle(manual=True)
-    save_state()
-    return jsonify({"ok": True})
-
-
-@app.route("/toggle_skim", methods=["POST"])
-def toggle_skim():
-    with state_lock:
-        STATE["skim_armed"] = not bool(STATE.get("skim_armed", False))
-        mode = "LIVE GATE.IO SPOT SKIMMING" if STATE["skim_armed"] else "PAPER SIMULATION"
-    add_log(f"⚡ Core 2 (Gate.io Spot Skimmer) switched to: {mode}")
-    save_state()
-    return jsonify({"ok": True, "skim_armed": STATE["skim_armed"], "message": f"Spot Skimmer mode: {mode}"})
-
-
-@app.route("/reset_anchor", methods=["POST"])
-def reset_anchor():
-    with state_lock:
-        pair = STATE.get("skim_pair", "QNT_USDT")
-        px = STATE.get("qnt_price", 0.0) if pair == "QNT_USDT" else STATE.get("ltc_price", 0.0)
-        STATE["skim_anchor_price"] = px
-        STATE["skim_active_entry"] = 0.0
-        STATE["skim_active_amount"] = 0.0
-    add_log(f"🎯 Reset {pair} Skimmer Anchor Price to ${px:.2f}.")
-    save_state()
-    return jsonify({"ok": True})
-
-
-@app.route("/scan_now", methods=["POST"])
-def scan_now():
-    run_unified_dual_core_cycle(manual=True)
-    return jsonify({"ok": True})
-
-
-@app.route("/deposit_yield", methods=["POST"])
-def deposit_yield_route():
-    ok, msg = deposit_into_moonwell_yield()
-    return jsonify({"ok": ok, "message": msg})
-
-
-@app.route("/withdraw_yield", methods=["POST"])
-def withdraw_yield_route():
-    ok, msg = withdraw_from_moonwell_yield()
-    return jsonify({"ok": ok, "message": msg})
-
-
-@app.route("/unwrap_weth", methods=["POST"])
-def unwrap_weth_route():
-    ok, msg = unwrap_weth_to_eth()
-    return jsonify({"ok": ok, "message": msg})
-
-
-@app.route("/deploy_guard", methods=["POST"])
-def deploy_guard_route():
-    ok, msg = compile_and_deploy_keeper_guard()
-    return jsonify({"ok": ok, "message": msg, "guard_contract": STATE.get("guard_contract", "")})
-
-
-@app.route("/toggle_live", methods=["POST"])
-def toggle_live():
-    with state_lock:
-        if not STATE.get("private_key") and not STATE.get("live_armed"):
-            return jsonify({"ok": False, "message": "Paste Private Key and click Save first."})
-        STATE["live_armed"] = not bool(STATE.get("live_armed", False))
-        mode_str = "LIVE ARMED" if STATE["live_armed"] else "DRY-RUN"
-    add_log(f"⚡ Core 1 (Base DeFi Engine) switched to: {mode_str}")
-    save_state()
-    return jsonify({"ok": True, "live_armed": STATE["live_armed"]})
+    return render_template_string(HTML_UI)
 
 
 if __name__ == "__main__":
-    sync_wallet_balances()
-    sync_gate_spot_balances()
+    ensure_worker_alive()
     port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=port)
